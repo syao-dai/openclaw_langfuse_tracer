@@ -1,0 +1,24 @@
+{
+  "name": "@openclaw/langfuse-tracer",
+  "version": "2026.3.26",
+  "description": "Sends OpenClaw agent traces to a self-hosted Langfuse instance for observability. No npm packages required — uses the Langfuse REST API directly via native fetch.",
+  "type": "module",
+  "keywords": [
+    "openclaw",
+    "langfuse",
+    "tracing",
+    "observability",
+    "monitoring"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "release": {
+      "publishToNpm": false
+    }
+  }
+}

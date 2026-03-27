@@ -1,0 +1,20 @@
+{
+  "id": "langfuse-tracer",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "trackedAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "List of agent IDs to trace. If empty or omitted, all agents will be traced."
+      }
+    }
+  },
+  "uiHints": {
+    "trackedAgents": {
+      "label": "Tracked Agents",
+      "help": "Agent IDs to trace (leave empty to trace all agents)"
+    }
+  }
+}
