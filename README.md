@@ -62,26 +62,25 @@ Trace: openclaw-agent-turn
 
 ```bash
 cd ~/.openclaw/workspace-<your-workspace>/.openclaw/extensions
-git clone https://github.com/syao-dai/openclaw_langfuse_tracer.git
+git clone https://github.com/syao-dai/openclaw_langfuse_tracer.git langfuse-tracer
 ```
 
-2. **Set environment variables**
-
-Add to your `docker-compose.yml` (or container environment):
-
-```yaml
-services:
-  openclaw-gateway:
-    environment:
-      - LANGFUSE_PUBLIC_KEY=pk-lf-xxx
-      - LANGFUSE_SECRET_KEY=sk-lf-xxx
-      - LANGFUSE_BASE_URL=http://langfuse-web:3000
-```
-
-3. **Install the plugin**
+2. **Install the plugin**
 
 ```bash
-openclaw plugins install /path/to/langfuse-tracer
+openclaw plugins install /path/to/langfuse-tracer -l
+openclaw gateway restart
+```
+
+3. **Configure via openclaw.json**
+
+```bash
+# Set your Langfuse credentials
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
+
+# Restart gateway
 openclaw gateway restart
 ```
 
@@ -99,13 +98,9 @@ You should see:
 
 ## ⚙️ Configuration
 
-### Basic Setup (Track All Agents)
+### Plugin Configuration via openclaw.json
 
-No additional configuration needed. The plugin will track all agents by default.
-
-### Advanced: Track Specific Agents
-
-Edit `~/.openclaw/openclaw.json`:
+All configuration is managed via `~/.openclaw/openclaw.json`:
 
 ```json
 {
@@ -114,7 +109,21 @@ Edit `~/.openclaw/openclaw.json`:
       "langfuse-tracer": {
         "enabled": true,
         "config": {
-          "trackedAgents": ["prod-agent", "fais-agent"]
+          "logLevel": "info",
+          "langfuse": {
+            "publicKey": "pk-lf-xxx",
+            "secretKey": "sk-lf-xxx",
+            "baseUrl": "http://langfuse-web:3000"
+          },
+          "trackedAgents": [],
+          "limits": {
+            "userInput": 2000,
+            "assistantOutput": 10000,
+            "systemPrompt": 20000,
+            "history": 5000,
+            "toolParams": 500,
+            "toolResult": 1000
+          }
         }
       }
     }
@@ -122,33 +131,50 @@ Edit `~/.openclaw/openclaw.json`:
 }
 ```
 
-Or use the CLI:
+### Using CLI
 
 ```bash
-openclaw config set plugins.entries.langfuse-tracer.config.trackedAgents '["prod-agent"]'
+# Set Langfuse credentials
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
+
+# Enable debug logging (optional)
+openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
+
+# Track specific agents (optional, empty = track all)
+openclaw config set plugins.entries.langfuse-tracer.config.trackedAgents '["prod-agent", "fais-agent"]'
+
+# Customize data limits (optional)
+openclaw config set plugins.entries.langfuse-tracer.config.limits.userInput 5000
+openclaw config set plugins.entries.langfuse-tracer.config.limits.assistantOutput 20000
+
+# Restart gateway to apply changes
 openclaw gateway restart
 ```
 
-### Environment Variables
+### Configuration Reference
 
-#### Required Variables
+#### Required Settings
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LANGFUSE_PUBLIC_KEY` | Langfuse project public key | `pk-lf-...` |
-| `LANGFUSE_SECRET_KEY` | Langfuse project secret key | `sk-lf-...` |
+| Config Key | Description | Example |
+|------------|-------------|---------|
+| `langfuse.publicKey` | Langfuse project public key | `pk-lf-xxx` |
+| `langfuse.secretKey` | Langfuse project secret key | `sk-lf-xxx` |
 
-#### Optional Variables
+#### Optional Settings
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LANGFUSE_BASE_URL` | Langfuse server URL | `http://172.21.0.1:3050` |
-| `LANGFUSE_LIMIT_USER_INPUT` | Max characters for user input | `2000` |
-| `LANGFUSE_LIMIT_ASSISTANT_OUTPUT` | Max characters for assistant output | `10000` |
-| `LANGFUSE_LIMIT_SYSTEM_PROMPT` | Max characters for system prompt | `20000` |
-| `LANGFUSE_LIMIT_HISTORY` | Max characters for conversation history (JSON) | `5000` |
-| `LANGFUSE_LIMIT_TOOL_PARAMS` | Max characters for tool parameters | `500` |
-| `LANGFUSE_LIMIT_TOOL_RESULT` | Max characters for tool result | `1000` |
+| Config Key | Description | Default |
+|------------|-------------|---------|
+| `langfuse.baseUrl` | Langfuse server URL | `http://172.21.0.1:3050` |
+| `logLevel` | Log level: `info` or `debug` | `info` |
+| `trackedAgents` | Array of agent IDs to trace (empty = all) | `[]` |
+| `limits.userInput` | Max chars for user input | `2000` |
+| `limits.assistantOutput` | Max chars for assistant output | `10000` |
+| `limits.systemPrompt` | Max chars for system prompt | `20000` |
+| `limits.history` | Max chars for conversation history (JSON) | `5000` |
+| `limits.toolParams` | Max chars for tool parameters | `500` |
+| `limits.toolResult` | Max chars for tool result | `1000` |
 
 ## 📊 What Gets Traced
 
@@ -270,15 +296,18 @@ openclaw gateway restart
    openclaw plugins list | grep langfuse
    ```
 
-2. **Verify environment variables**
+2. **Verify configuration**
    ```bash
-   # In the gateway container
-   echo $LANGFUSE_PUBLIC_KEY
-   echo $LANGFUSE_SECRET_KEY
-   echo $LANGFUSE_BASE_URL
+   openclaw config get plugins.entries.langfuse-tracer.config
    ```
 
-3. **Check gateway logs**
+3. **Enable debug mode**
+   ```bash
+   openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
+   openclaw gateway restart
+   ```
+
+4. **Check gateway logs**
    ```bash
    tail -f ~/.openclaw/logs/gateway-*.log | grep langfuse
    ```
@@ -287,12 +316,15 @@ openclaw gateway restart
    ```
    [langfuse-tracer] Tracking all agents
    [langfuse-tracer] Langfuse tracing enabled → http://...
+   [langfuse-tracer] [DEBUG] before_agent_start: ...
+   [langfuse-tracer] [DEBUG] llm_input: ...
+   [langfuse-tracer] [DEBUG] llm_output: ...
+   [langfuse-tracer] [DEBUG] agent_end: ...
    [langfuse-tracer] Successfully sent trace for agent "prod-agent" (...)
    ```
 
-4. **Test Langfuse connectivity**
+5. **Test Langfuse connectivity**
    ```bash
-   # From gateway container
    curl http://langfuse-web:3000/api/public/health
    ```
 
@@ -370,30 +402,28 @@ To prevent oversized payloads, the plugin truncates data at configurable limits.
 
 #### Default Limits
 
-| Data Type | Default | Environment Variable |
-|-----------|---------|---------------------|
-| System prompt | 20,000 chars | `LANGFUSE_LIMIT_SYSTEM_PROMPT` |
-| Conversation history | 5,000 chars | `LANGFUSE_LIMIT_HISTORY` |
-| User input | 2,000 chars | `LANGFUSE_LIMIT_USER_INPUT` |
-| Assistant output | 10,000 chars | `LANGFUSE_LIMIT_ASSISTANT_OUTPUT` |
-| Tool parameters | 500 chars | `LANGFUSE_LIMIT_TOOL_PARAMS` |
-| Tool result | 1,000 chars | `LANGFUSE_LIMIT_TOOL_RESULT` |
+| Data Type | Default | Config Key |
+|-----------|---------|------------|
+| System prompt | 20,000 chars | `limits.systemPrompt` |
+| Conversation history | 5,000 chars | `limits.history` |
+| User input | 2,000 chars | `limits.userInput` |
+| Assistant output | 10,000 chars | `limits.assistantOutput` |
+| Tool parameters | 500 chars | `limits.toolParams` |
+| Tool result | 1,000 chars | `limits.toolResult` |
 
 #### Customizing Limits
 
-You can adjust these limits via environment variables:
+You can adjust these limits via openclaw.json or CLI:
 
-```yaml
-services:
-  openclaw-gateway:
-    environment:
-      - LANGFUSE_PUBLIC_KEY=pk-lf-xxx
-      - LANGFUSE_SECRET_KEY=sk-lf-xxx
-      - LANGFUSE_BASE_URL=http://langfuse-web:3000
-      # Custom data limits
-      - LANGFUSE_LIMIT_SYSTEM_PROMPT=50000
-      - LANGFUSE_LIMIT_ASSISTANT_OUTPUT=20000
-      - LANGFUSE_LIMIT_TOOL_RESULT=5000
+```bash
+# Increase system prompt limit
+openclaw config set plugins.entries.langfuse-tracer.config.limits.systemPrompt 50000
+
+# Increase assistant output limit
+openclaw config set plugins.entries.langfuse-tracer.config.limits.assistantOutput 20000
+
+# Restart gateway
+openclaw gateway restart
 ```
 
 **Note**: Larger limits may result in:
@@ -410,8 +440,8 @@ services:
 
 ### Authentication
 - Uses Basic Auth (base64 encoded credentials)
-- Credentials stored as environment variables
-- Never logged or persisted by the plugin
+- Credentials stored securely in openclaw.json
+- Never logged by the plugin
 
 ### Data Sanitization
 - Consider sanitizing sensitive data in:
@@ -489,10 +519,12 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 📊 Changelog
 
-### v2026.3.28 (Current)
-- ✅ **Configurable data limits** - All truncation limits now configurable via environment variables
-- ✅ Complete system prompt capture (default 20K chars)
-- ✅ Conversation history tracking (default 5K chars JSON)
+### v2026.4.7 (Current)
+- ✅ **Plugin-based configuration** - All settings managed via openclaw.json (no environment variables needed)
+- ✅ **Debug logging** - Configurable log level (`info` or `debug`) for troubleshooting
+- ✅ **Configurable data limits** - All truncation limits configurable via plugin config
+- ✅ Complete system prompt capture (configurable, default 20K chars)
+- ✅ Conversation history tracking (configurable, default 5K chars JSON)
 - ✅ Tool call monitoring with timing
 - ✅ Token usage tracking (input/output/cache)
 - ✅ Selective agent tracking via config
@@ -500,7 +532,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - ✅ Zero npm dependencies
 
 ### v2026.3.26
-- Initial release with fixed data limits
+- Initial release with environment variable configuration
 
 ---
 

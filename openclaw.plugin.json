@@ -1,20 +1,108 @@
 {
   "id": "langfuse-tracer",
-  "configSchema": {
+    "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "logLevel": {
+        "type": "string",
+        "enum": ["info", "debug"],
+        "description": "Log level: 'info' for normal operation, 'debug' for detailed event logs",
+        "default": "info"
+      },
+      "langfuse": {
+        "type": "object",
+        "description": "Langfuse connection settings",
+        "properties": {
+          "publicKey": {
+            "type": "string",
+            "description": "Langfuse project public key"
+          },
+          "secretKey": {
+            "type": "string",
+            "description": "Langfuse project secret key"
+          },
+          "baseUrl": {
+            "type": "string",
+            "description": "Langfuse server URL",
+            "default": "http://172.21.0.1:3050"
+          }
+        },
+        "required": ["publicKey", "secretKey"]
+      },
       "trackedAgents": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "List of agent IDs to trace. If empty or omitted, all agents will be traced."
+        "description": "List of agent IDs to trace. If empty or omitted, all agents will be traced.",
+        "default": []
+      },
+      "limits": {
+        "type": "object",
+        "description": "Data truncation limits",
+        "properties": {
+          "userInput": {
+            "type": "number",
+            "description": "Max characters for user input",
+            "default": 2000
+          },
+          "assistantOutput": {
+            "type": "number",
+            "description": "Max characters for assistant output",
+            "default": 10000
+          },
+          "systemPrompt": {
+            "type": "number",
+            "description": "Max characters for system prompt",
+            "default": 20000
+          },
+          "history": {
+            "type": "number",
+            "description": "Max characters for conversation history JSON",
+            "default": 5000
+          },
+          "toolParams": {
+            "type": "number",
+            "description": "Max characters for tool parameters",
+            "default": 500
+          },
+          "toolResult": {
+            "type": "number",
+            "description": "Max characters for tool result",
+            "default": 1000
+          }
+        }
       }
     }
   },
   "uiHints": {
+    "logLevel": {
+      "label": "Log Level",
+      "help": "Set to 'debug' to see detailed event logs for troubleshooting"
+    },
+    "langfuse": {
+      "label": "Langfuse Configuration",
+      "help": "Configure connection to your self-hosted Langfuse instance"
+    },
+    "langfuse.publicKey": {
+      "label": "Public Key",
+      "help": "Your Langfuse project public key (starts with pk-lf-)"
+    },
+    "langfuse.secretKey": {
+      "label": "Secret Key",
+      "help": "Your Langfuse project secret key (starts with sk-lf-)",
+      "secret": true
+    },
+    "langfuse.baseUrl": {
+      "label": "Base URL",
+      "help": "URL of your Langfuse server (e.g., http://langfuse-web:3000)"
+    },
     "trackedAgents": {
       "label": "Tracked Agents",
       "help": "Agent IDs to trace (leave empty to trace all agents)"
+    },
+    "limits": {
+      "label": "Data Limits",
+      "help": "Configure maximum characters for different data types"
     }
   }
 }

@@ -6,22 +6,42 @@ import type { OpenClawPluginApi } from "../api.js";
  * Sends an agent trace + LLM generation to Langfuse after every agent turn.
  * Uses the Langfuse REST API directly (no npm packages required).
  *
- * Required env vars:
- *   LANGFUSE_PUBLIC_KEY   — project public key
- *   LANGFUSE_SECRET_KEY   — project secret key
- *   LANGFUSE_BASE_URL     — e.g. http://172.21.0.1:3050
+ * Configuration via openclaw.json:
+ *   langfuse.publicKey      — Langfuse project public key (required)
+ *   langfuse.secretKey      — Langfuse project secret key (required)
+ *   langfuse.baseUrl        — Langfuse server URL (default: http://172.21.0.1:3050)
+ *   
+ *   limits.userInput        — Max chars for user input (default: 2000)
+ *   limits.assistantOutput  — Max chars for assistant output (default: 10000)
+ *   limits.systemPrompt     — Max chars for system prompt (default: 20000)
+ *   limits.history          — Max chars for conversation history JSON (default: 5000)
+ *   limits.toolParams       — Max chars for tool parameters (default: 500)
+ *   limits.toolResult       — Max chars for tool result (default: 1000)
+ *   
+ *   trackedAgents           — Array of agent IDs to trace (default: [] = all agents)
  *
- * Optional data limit env vars (defaults in parentheses):
- *   LANGFUSE_LIMIT_USER_INPUT         — max chars for user input (2000)
- *   LANGFUSE_LIMIT_ASSISTANT_OUTPUT   — max chars for assistant output (10000)
- *   LANGFUSE_LIMIT_SYSTEM_PROMPT      — max chars for system prompt (20000)
- *   LANGFUSE_LIMIT_HISTORY            — max chars for conversation history JSON (5000)
- *   LANGFUSE_LIMIT_TOOL_PARAMS        — max chars for tool parameters (500)
- *   LANGFUSE_LIMIT_TOOL_RESULT        — max chars for tool result (1000)
+ * Example configuration:
+ *   openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
+ *   openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
+ *   openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse:3000"
  */
 
 interface PluginConfig {
   trackedAgents?: string[];
+  logLevel?: "info" | "debug";
+  langfuse?: {
+    publicKey?: string;
+    secretKey?: string;
+    baseUrl?: string;
+  };
+  limits?: {
+    userInput?: number;
+    assistantOutput?: number;
+    systemPrompt?: number;
+    history?: number;
+    toolParams?: number;
+    toolResult?: number;
+  };
 }
 
 interface PendingPrompt {
@@ -113,30 +133,44 @@ function randomId(): string {
 
 export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   const pluginConfig = (api.pluginConfig ?? {}) as PluginConfig;
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY?.trim();
-  const secretKey = process.env.LANGFUSE_SECRET_KEY?.trim();
-  const baseUrl = (process.env.LANGFUSE_BASE_URL?.trim() ?? "http://172.21.0.1:3050").replace(
-    /\/$/,
-    "",
-  );
+  
+  // Setup logging
+  const logLevel = pluginConfig.logLevel ?? "info";
+  const isDebug = logLevel === "debug";
+  const debug = (message: string) => {
+    if (isDebug) api.logger.info(message);
+  };
+  
+  // Read credentials from plugin config only
+  const publicKey = pluginConfig.langfuse?.publicKey?.trim();
+  const secretKey = pluginConfig.langfuse?.secretKey?.trim();
+  const baseUrl = (
+    pluginConfig.langfuse?.baseUrl?.trim() 
+    ?? "http://172.21.0.1:3050"
+  ).replace(/\/$/, "");
 
   if (!publicKey || !secretKey) {
     api.logger.info(
-      "[langfuse-tracer] LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set — tracing disabled",
+      "[langfuse-tracer] Langfuse credentials not configured. " +
+      "Configure via openclaw.json:\n" +
+      "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey 'pk-lf-xxx'\n" +
+      "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey 'sk-lf-xxx'\n" +
+      "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl 'http://langfuse:3000'\n" +
+      "— tracing disabled",
     );
     return;
   }
 
   const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
 
-  // Parse data limits from environment variables with defaults
+    // Parse data limits from plugin config with defaults
   const dataLimits = {
-    userInput: parseInt(process.env.LANGFUSE_LIMIT_USER_INPUT ?? "2000", 10),
-    assistantOutput: parseInt(process.env.LANGFUSE_LIMIT_ASSISTANT_OUTPUT ?? "10000", 10),
-    systemPrompt: parseInt(process.env.LANGFUSE_LIMIT_SYSTEM_PROMPT ?? "20000", 10),
-    history: parseInt(process.env.LANGFUSE_LIMIT_HISTORY ?? "5000", 10),
-    toolParams: parseInt(process.env.LANGFUSE_LIMIT_TOOL_PARAMS ?? "500", 10),
-    toolResult: parseInt(process.env.LANGFUSE_LIMIT_TOOL_RESULT ?? "1000", 10),
+    userInput: pluginConfig.limits?.userInput ?? 2000,
+    assistantOutput: pluginConfig.limits?.assistantOutput ?? 10000,
+    systemPrompt: pluginConfig.limits?.systemPrompt ?? 20000,
+    history: pluginConfig.limits?.history ?? 5000,
+    toolParams: pluginConfig.limits?.toolParams ?? 500,
+    toolResult: pluginConfig.limits?.toolResult ?? 1000,
   };
 
   api.logger.info(
@@ -160,13 +194,22 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     api.logger.info("[langfuse-tracer] Tracking all agents");
   }
 
-  api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
+      api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
+  if (isDebug) {
+    api.logger.info(`[langfuse-tracer] Debug mode enabled`);
+  }
 
   // Store run contexts keyed by runId
   const runContexts = new Map<string, RunContext>();
   const pendingPrompts = new Map<string, PendingPrompt>();
 
   api.on("before_agent_start", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] before_agent_start: ` +
+      `agentId=${eventCtx.agentId}, sessionKey=${eventCtx.sessionKey}, ` +
+      `prompt=${event.prompt?.slice(0, 100)}...`,
+    );
+    
     const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
     pendingPrompts.set(key, {
       prompt: event.prompt ?? "",
@@ -174,8 +217,13 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     });
   });
 
-  // Capture LLM input (system prompt, history)
+    // Capture LLM input (system prompt, history)
   api.on("llm_input", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] llm_input: ` +
+      `runId=${event.runId}, model=${event.model}, provider=${event.provider}`,
+    );
+    
     const ctx: RunContext = {
       runId: event.runId,
       sessionId: event.sessionId,
@@ -194,8 +242,13 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     runContexts.set(event.runId, ctx);
   });
 
-  // Capture LLM output (usage stats)
+    // Capture LLM output (usage stats)
   api.on("llm_output", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] llm_output: ` +
+      `runId=${event.runId}, usage=${JSON.stringify(event.usage)}`,
+    );
+    
     const ctx = runContexts.get(event.runId);
     if (ctx) {
       ctx.llmOutput = {
@@ -206,8 +259,13 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     }
   });
 
-  // Capture tool calls
+    // Capture tool calls
   api.on("before_tool_call", (event, toolCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] before_tool_call: ` +
+      `runId=${event.runId}, tool=${event.toolName}`,
+    );
+    
     const ctx = event.runId ? runContexts.get(event.runId) : null;
     if (ctx) {
       ctx.toolCalls.push({
@@ -220,6 +278,11 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   });
 
   api.on("after_tool_call", (event, toolCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] after_tool_call: ` +
+      `runId=${event.runId}, tool=${event.toolName}, durationMs=${event.durationMs}`,
+    );
+    
     const ctx = event.runId ? runContexts.get(event.runId) : null;
     if (ctx) {
       const toolCall = ctx.toolCalls.find(
@@ -233,11 +296,17 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     }
   });
 
-  api.on("agent_end", async (event, eventCtx) => {
+    api.on("agent_end", async (event, eventCtx) => {
     const { agentId, sessionKey } = eventCtx;
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] agent_end: ` +
+      `agentId=${agentId}, sessionKey=${sessionKey}, success=${event.success}, messages=${event.messages.length}`,
+    );
 
     // Filter: only track specified agents if trackedAgents is configured
     if (trackedAgents !== null && agentId && !trackedAgents.has(agentId)) {
+      debug(`[langfuse-tracer] [DEBUG] Skipping agent ${agentId} (not in trackedAgents)`);
       return; // Skip this agent
     }
 

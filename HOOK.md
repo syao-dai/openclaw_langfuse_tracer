@@ -15,28 +15,29 @@ Sends OpenClaw agent traces to a self-hosted Langfuse instance for observability
 This plugin follows the standard OpenClaw plugin architecture:
 
 - `index.ts` - Plugin entry point using `definePluginEntry`
-- `src/service.ts` - Service implementation with lifecycle management
+- `src/tracer.ts` - Core tracer implementation using plugin hooks
 - `api.ts` - Type exports for Plugin SDK
 - `openclaw.plugin.json` - Plugin metadata and config schema
 - `package.json` - Package configuration with OpenClaw extensions
 
+### Plugin Hooks
+
+The plugin listens to these OpenClaw hook events:
+
+- `before_agent_start` - Captures initial user prompt
+- `llm_input` - Captures system prompt, history, and model info
+- `llm_output` - Captures token usage and assistant response
+- `before_tool_call` - Records tool invocation start
+- `after_tool_call` - Records tool result and timing
+- `agent_end` - Assembles and sends complete trace to Langfuse
+
 ## Configuration
 
-This plugin supports two levels of configuration:
+All configuration is managed via `openclaw.json`. No environment variables needed.
 
-### 1. Environment Variables (Required)
+### Plugin Configuration
 
-These must be set in the `openclaw-gateway` container:
-
-| Variable              | Description                 | Example                                    |
-| --------------------- | --------------------------- | ------------------------------------------ |
-| `LANGFUSE_PUBLIC_KEY` | Langfuse project public key | Same as `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` |
-| `LANGFUSE_SECRET_KEY` | Langfuse project secret key | Same as `LANGFUSE_INIT_PROJECT_SECRET_KEY` |
-| `LANGFUSE_BASE_URL`   | Langfuse server URL         | `http://172.21.0.1:3050` (Docker host)     |
-
-### 2. Plugin Configuration (Optional)
-
-Configure which agents to track in `openclaw.json`:
+Configure the plugin in `openclaw.json`:
 
 ```json
 {
@@ -45,7 +46,21 @@ Configure which agents to track in `openclaw.json`:
       "langfuse-tracer": {
         "enabled": true,
         "config": {
-          "trackedAgents": ["agent-1", "agent-2"]
+          "logLevel": "info",
+          "langfuse": {
+            "publicKey": "pk-lf-xxx",
+            "secretKey": "sk-lf-xxx",
+            "baseUrl": "http://langfuse-web:3000"
+          },
+          "trackedAgents": [],
+          "limits": {
+            "userInput": 2000,
+            "assistantOutput": 10000,
+            "systemPrompt": 20000,
+            "history": 5000,
+            "toolParams": 500,
+            "toolResult": 1000
+          }
         }
       }
     }
@@ -53,52 +68,59 @@ Configure which agents to track in `openclaw.json`:
 }
 ```
 
-**Plugin Configuration Options:**
+### Using CLI
 
-| Option          | Type       | Description                | Default           |
-| --------------- | ---------- | -------------------------- | ----------------- |
-| `trackedAgents` | `string[]` | List of agent IDs to trace | `[]` (all agents) |
+```bash
+# Set Langfuse credentials
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
 
-**Behavior:**
+# Set tracked agents (empty array = track all)
+openclaw config set plugins.entries.langfuse-tracer.config.trackedAgents '["prod-agent"]'
 
-- **Empty or omitted** (`[]` or not set): Traces **all agents**
-- **Specific IDs** (`["my-agent", "prod-agent"]`): Only traces the specified agents
+# Enable debug logging
+openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
 
-### Example: Track Specific Agent
+# Set custom limits (optional)
+openclaw config set plugins.entries.langfuse-tracer.config.limits.userInput 5000
 
-```json
-{
-  "agents": {
-    "list": [
-      { "id": "prod-agent", "name": "Production Agent" },
-      { "id": "dev-agent", "name": "Development Agent" }
-    ]
-  },
-  "plugins": {
-    "entries": {
-      "langfuse-tracer": {
-        "enabled": true,
-        "config": {
-          "trackedAgents": ["prod-agent"]
-        }
-      }
-    }
-  }
-}
+# Restart gateway
+openclaw gateway restart
 ```
 
-In this example, only `prod-agent` conversations will be sent to Langfuse.
+### Configuration Reference
 
-### Example Docker Compose Configuration
+#### Langfuse Connection
 
-```yaml
-services:
-  openclaw-gateway:
-    environment:
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
-      - LANGFUSE_BASE_URL=http://172.21.0.1:3050
-```
+| Config Key | Description | Default |
+| ---------- | ----------- | ------- |
+| `langfuse.publicKey` | Langfuse project public key | *(required)* |
+| `langfuse.secretKey` | Langfuse project secret key | *(required)* |
+| `langfuse.baseUrl` | Langfuse server URL | `http://172.21.0.1:3050` |
+
+#### Logging
+
+| Config Key | Description | Default |
+| ---------- | ----------- | ------- |
+| `logLevel` | Log level: `info` or `debug` | `info` |
+
+#### Data Limits
+
+| Config Key | Description | Default |
+| ---------- | ----------- | ------- |
+| `limits.userInput` | Max chars for user input | `2000` |
+| `limits.assistantOutput` | Max chars for assistant output | `10000` |
+| `limits.systemPrompt` | Max chars for system prompt | `20000` |
+| `limits.history` | Max chars for history JSON | `5000` |
+| `limits.toolParams` | Max chars for tool params | `500` |
+| `limits.toolResult` | Max chars for tool result | `1000` |
+
+#### Agent Tracking
+
+| Config Key | Description | Default |
+| ---------- | ----------- | ------- |
+| `trackedAgents` | Array of agent IDs to trace | `[]` (all agents) |
 
 ## Data Transmission
 
@@ -140,7 +162,16 @@ For each agent turn, two records are created:
 ## Installation
 
 ```bash
-openclaw plugins install ./langfuse-tracer
+# Install the plugin
+openclaw plugins install /path/to/langfuse-tracer -l
+
+# Configure credentials
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
+openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
+
+# Restart gateway
+openclaw gateway restart
 ```
 
 ## Verification
@@ -148,21 +179,51 @@ openclaw plugins install ./langfuse-tracer
 After installation, check the logs:
 
 - ✅ **Enabled**: `[langfuse-tracer] Langfuse tracing enabled → http://...`
-- ⚠️ **Disabled**: `[langfuse-tracer] LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set — tracing disabled`
+- ⚠️ **Disabled**: `[langfuse-tracer] Langfuse credentials not configured — tracing disabled`
+
+To see detailed event logs, enable debug mode:
+
+```bash
+openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
+openclaw gateway restart
+```
+
+You should see:
+```
+[langfuse-tracer] Debug mode enabled
+[langfuse-tracer] [DEBUG] before_agent_start: ...
+[langfuse-tracer] [DEBUG] llm_input: ...
+[langfuse-tracer] [DEBUG] llm_output: ...
+[langfuse-tracer] [DEBUG] agent_end: ...
+```
 
 ## Troubleshooting
 
 ### Tracing not working
 
-1. Verify environment variables are set in openclaw-gateway container
-2. Check Langfuse server is accessible from container
-3. Verify public/secret keys match your Langfuse project
+1. Verify configuration is set:
+   ```bash
+   openclaw config get plugins.entries.langfuse-tracer.config
+   ```
+
+2. Check Langfuse server is accessible:
+   ```bash
+   curl http://langfuse-web:3000/api/public/health
+   ```
+
+3. Enable debug logging:
+   ```bash
+   openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
+   openclaw gateway restart
+   ```
+
 4. Check openclaw-gateway logs for `[langfuse-tracer]` messages
 
 ### Ingestion failures
 
 - Check `[langfuse-tracer] Ingestion failed` warnings in logs
-- Verify LANGFUSE_BASE_URL is correct (use Docker host gateway IP for containerized Langfuse)
+- Verify `langfuse.baseUrl` is correct
+- Verify `langfuse.publicKey` and `langfuse.secretKey` match your Langfuse project
 - Test connectivity: `curl ${LANGFUSE_BASE_URL}/api/public/health`
 
 ## License
