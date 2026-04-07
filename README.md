@@ -131,13 +131,24 @@ openclaw gateway restart
 
 ### Environment Variables
 
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `LANGFUSE_PUBLIC_KEY` | ✅ Yes | Langfuse project public key | `pk-lf-...` |
-| `LANGFUSE_SECRET_KEY` | ✅ Yes | Langfuse project secret key | `sk-lf-...` |
-| `LANGFUSE_BASE_URL` | ❌ No | Langfuse server URL | `http://langfuse-web:3000` |
+#### Required Variables
 
-**Default**: `http://172.21.0.1:3050` (Docker host gateway)
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `LANGFUSE_PUBLIC_KEY` | Langfuse project public key | `pk-lf-...` |
+| `LANGFUSE_SECRET_KEY` | Langfuse project secret key | `sk-lf-...` |
+
+#### Optional Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LANGFUSE_BASE_URL` | Langfuse server URL | `http://172.21.0.1:3050` |
+| `LANGFUSE_LIMIT_USER_INPUT` | Max characters for user input | `2000` |
+| `LANGFUSE_LIMIT_ASSISTANT_OUTPUT` | Max characters for assistant output | `10000` |
+| `LANGFUSE_LIMIT_SYSTEM_PROMPT` | Max characters for system prompt | `20000` |
+| `LANGFUSE_LIMIT_HISTORY` | Max characters for conversation history (JSON) | `5000` |
+| `LANGFUSE_LIMIT_TOOL_PARAMS` | Max characters for tool parameters | `500` |
+| `LANGFUSE_LIMIT_TOOL_RESULT` | Max characters for tool result | `1000` |
 
 ## 📊 What Gets Traced
 
@@ -355,13 +366,40 @@ Common causes:
 
 ### Data Limits
 
-To prevent oversized payloads:
-- System prompt: 20,000 characters
-- Conversation history: 5,000 characters (JSON)
-- User input: 2,000 characters
-- Assistant output: 10,000 characters
-- Tool params: 500 characters
-- Tool result: 1,000 characters
+To prevent oversized payloads, the plugin truncates data at configurable limits.
+
+#### Default Limits
+
+| Data Type | Default | Environment Variable |
+|-----------|---------|---------------------|
+| System prompt | 20,000 chars | `LANGFUSE_LIMIT_SYSTEM_PROMPT` |
+| Conversation history | 5,000 chars | `LANGFUSE_LIMIT_HISTORY` |
+| User input | 2,000 chars | `LANGFUSE_LIMIT_USER_INPUT` |
+| Assistant output | 10,000 chars | `LANGFUSE_LIMIT_ASSISTANT_OUTPUT` |
+| Tool parameters | 500 chars | `LANGFUSE_LIMIT_TOOL_PARAMS` |
+| Tool result | 1,000 chars | `LANGFUSE_LIMIT_TOOL_RESULT` |
+
+#### Customizing Limits
+
+You can adjust these limits via environment variables:
+
+```yaml
+services:
+  openclaw-gateway:
+    environment:
+      - LANGFUSE_PUBLIC_KEY=pk-lf-xxx
+      - LANGFUSE_SECRET_KEY=sk-lf-xxx
+      - LANGFUSE_BASE_URL=http://langfuse-web:3000
+      # Custom data limits
+      - LANGFUSE_LIMIT_SYSTEM_PROMPT=50000
+      - LANGFUSE_LIMIT_ASSISTANT_OUTPUT=20000
+      - LANGFUSE_LIMIT_TOOL_RESULT=5000
+```
+
+**Note**: Larger limits may result in:
+- Higher network bandwidth usage
+- Increased Langfuse database storage
+- Potential ingestion failures if payload exceeds Langfuse limits
 
 ## 🔐 Security & Privacy
 
@@ -451,14 +489,18 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 📊 Changelog
 
-### v2026.3.26 (Current)
-- ✅ Complete system prompt capture (20K chars)
-- ✅ Conversation history tracking (5K chars JSON)
+### v2026.3.28 (Current)
+- ✅ **Configurable data limits** - All truncation limits now configurable via environment variables
+- ✅ Complete system prompt capture (default 20K chars)
+- ✅ Conversation history tracking (default 5K chars JSON)
 - ✅ Tool call monitoring with timing
 - ✅ Token usage tracking (input/output/cache)
 - ✅ Selective agent tracking via config
 - ✅ Production-ready with error handling
 - ✅ Zero npm dependencies
+
+### v2026.3.26
+- Initial release with fixed data limits
 
 ---
 

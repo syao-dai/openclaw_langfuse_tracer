@@ -10,6 +10,14 @@ import type { OpenClawPluginApi } from "../api.js";
  *   LANGFUSE_PUBLIC_KEY   — project public key
  *   LANGFUSE_SECRET_KEY   — project secret key
  *   LANGFUSE_BASE_URL     — e.g. http://172.21.0.1:3050
+ *
+ * Optional data limit env vars (defaults in parentheses):
+ *   LANGFUSE_LIMIT_USER_INPUT         — max chars for user input (2000)
+ *   LANGFUSE_LIMIT_ASSISTANT_OUTPUT   — max chars for assistant output (10000)
+ *   LANGFUSE_LIMIT_SYSTEM_PROMPT      — max chars for system prompt (20000)
+ *   LANGFUSE_LIMIT_HISTORY            — max chars for conversation history JSON (5000)
+ *   LANGFUSE_LIMIT_TOOL_PARAMS        — max chars for tool parameters (500)
+ *   LANGFUSE_LIMIT_TOOL_RESULT        — max chars for tool result (1000)
  */
 
 interface PluginConfig {
@@ -120,6 +128,26 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   }
 
   const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
+
+  // Parse data limits from environment variables with defaults
+  const dataLimits = {
+    userInput: parseInt(process.env.LANGFUSE_LIMIT_USER_INPUT ?? "2000", 10),
+    assistantOutput: parseInt(process.env.LANGFUSE_LIMIT_ASSISTANT_OUTPUT ?? "10000", 10),
+    systemPrompt: parseInt(process.env.LANGFUSE_LIMIT_SYSTEM_PROMPT ?? "20000", 10),
+    history: parseInt(process.env.LANGFUSE_LIMIT_HISTORY ?? "5000", 10),
+    toolParams: parseInt(process.env.LANGFUSE_LIMIT_TOOL_PARAMS ?? "500", 10),
+    toolResult: parseInt(process.env.LANGFUSE_LIMIT_TOOL_RESULT ?? "1000", 10),
+  };
+
+  api.logger.info(
+    `[langfuse-tracer] Data limits: ` +
+    `user=${dataLimits.userInput}, ` +
+    `assistant=${dataLimits.assistantOutput}, ` +
+    `system=${dataLimits.systemPrompt}, ` +
+    `history=${dataLimits.history}, ` +
+    `toolParams=${dataLimits.toolParams}, ` +
+    `toolResult=${dataLimits.toolResult}`,
+  );
 
   // Parse tracked agents configuration
   let trackedAgents: Set<string> | null = null; // null = track all agents
@@ -241,7 +269,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i] as MessageContent | undefined;
         if (msg?.role === "user") {
-          userInput = extractText(msg.content, 2000);
+          userInput = extractText(msg.content, dataLimits.userInput);
           break;
         }
       }
@@ -252,7 +280,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i] as MessageContent | undefined;
       if (msg?.role === "assistant") {
-        assistantOutput = extractText(msg.content, 10000); // Increase limit
+        assistantOutput = extractText(msg.content, dataLimits.assistantOutput);
         break;
       }
     }
@@ -267,14 +295,14 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
 
     // System prompt from llm_input
     if (runCtx?.systemPrompt) {
-      inputParts.push(`\n### System Prompt\n${runCtx.systemPrompt.slice(0, 20000)}`);
+      inputParts.push(`\n### System Prompt\n${runCtx.systemPrompt.slice(0, dataLimits.systemPrompt)}`);
     }
 
     // History messages summary
     if (runCtx?.historyMessages && runCtx.historyMessages.length > 0) {
       inputParts.push(
         `\n### Conversation History (${runCtx.historyMessages.length} messages)\n` +
-          JSON.stringify(runCtx.historyMessages, null, 2).slice(0, 5000),
+          JSON.stringify(runCtx.historyMessages, null, 2).slice(0, dataLimits.history),
       );
     }
 
@@ -295,10 +323,10 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
         outputParts.push(
           `\n#### ${idx + 1}. ${tool.toolName}` +
             `\n- Duration: ${tool.durationMs ?? "?"}ms` +
-            `\n- Params: ${JSON.stringify(tool.params).slice(0, 500)}` +
+            `\n- Params: ${JSON.stringify(tool.params).slice(0, dataLimits.toolParams)}` +
             (tool.error
               ? `\n- Error: ${tool.error}`
-              : `\n- Result: ${JSON.stringify(tool.result).slice(0, 1000)}`),
+              : `\n- Result: ${JSON.stringify(tool.result).slice(0, dataLimits.toolResult)}`),
         );
       });
     }
