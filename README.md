@@ -178,6 +178,34 @@ openclaw gateway restart
 
 ## 📊 What Gets Traced
 
+### Data Model Overview
+
+The plugin follows Langfuse's observability data model:
+
+```
+Trace (one agent run)
+└─ Generation (LLM interaction session)
+   ├─ Span (tool_call_1)
+   ├─ Span (tool_call_2)
+   └─ Span (tool_call_N)
+```
+
+**⚠️ Important Limitation:**
+
+Due to OpenClaw's hook architecture, the plugin captures the agent run as a **single Generation** with all tool calls nested underneath. While the agent internally makes multiple LLM calls to decide which tools to use, these intermediate calls are not exposed through separate `llm_input`/`llm_output` hooks.
+
+This means:
+- ✅ You can see **all tool calls** with precise timing and parameters
+- ✅ You get **total token usage** (accumulated from all LLM calls)
+- ❌ You cannot see individual LLM decision cycles separately
+
+For example, an agent that reads files → analyzes → executes commands will show:
+- 1 Trace = entire agent run
+- 1 Generation = all LLM interactions combined
+- 7 Spans = each tool call (read × 2, exec × 2, process × 2, write × 1)
+
+See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhancement plans.
+
 ### For Each Agent Turn
 
 #### 1. Trace Record

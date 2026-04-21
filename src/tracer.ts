@@ -3,7 +3,11 @@ import type { OpenClawPluginApi } from "../api.js";
 /**
  * langfuse-tracer — OpenClaw plugin
  *
- * Sends an agent trace + LLM generation to Langfuse after every agent turn.
+ * Traces OpenClaw agent executions to Langfuse following the proper observability data model:
+ * - Each agent run (before_agent_start → agent_end) = ONE Trace
+ * - Each llm_input/llm_output pair = ONE Generation observation
+ * - Each tool call = ONE Span observation (nested under its Generation)
+ *
  * Uses the Langfuse REST API directly (no npm packages required).
  *
  * Configuration via openclaw.json:
@@ -44,46 +48,49 @@ interface PluginConfig {
   };
 }
 
-interface PendingPrompt {
-  prompt: string;
-  startedAt: number;
-}
-
-interface RunContext {
-  runId: string;
-  sessionId: string;
+// Represents an active agent trace (one agent run from start to end)
+interface AgentTrace {
+  traceId: string;
   agentId?: string;
   sessionKey?: string;
-  provider?: string;
-  model?: string;
-  systemPrompt?: string;
-  historyMessages?: unknown[];
-  toolCalls: ToolCallRecord[];
-  llmInput?: {
-    timestamp: number;
-    imagesCount: number;
-  };
-  llmOutput?: {
-    timestamp: number;
-    assistantTexts: string[];
-    usage?: {
-      input?: number;
-      output?: number;
-      cacheRead?: number;
-      cacheWrite?: number;
-      total?: number;
-    };
-  };
+  userInput: string;  // Original user prompt from before_agent_start
+  startTime: number;
+  generations: GenerationRecord[];  // All LLM calls during this agent run
 }
 
-interface ToolCallRecord {
+// Represents one LLM generation (llm_input + llm_output pair)
+interface GenerationRecord {
+  generationId: string;
+  runId: string;
+  model?: string;
+  provider?: string;
+  systemPrompt?: string;
+  historyMessages?: unknown[];
+  startTime: number;
+  endTime?: number;
+  input: string;  // The prompt sent to LLM
+  output?: string;  // The LLM response
+  usage?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
+  spans: SpanRecord[];  // Tool calls that happened during this generation
+}
+
+// Represents one tool call (span observation)
+interface SpanRecord {
+  spanId: string;
   toolName: string;
   toolCallId?: string;
-  params: Record<string, unknown>;
-  result?: unknown;
+  startTime: number;
+  endTime?: number;
+  input: Record<string, unknown>;  // Tool parameters
+  output?: unknown;  // Tool result
   error?: string;
-  durationMs?: number;
-  timestamp: number;
+  metadata?: Record<string, unknown>;
 }
 
 interface MessageContent {
@@ -100,15 +107,9 @@ interface ContentBlock {
   text?: string;
 }
 
-interface LangfuseUsage {
-  input?: number;
-  output?: number;
-  unit: "TOKENS";
-}
-
 interface LangfuseBatchItem {
   id: string;
-  type: "trace-create" | "generation-create";
+  type: "trace-create" | "generation-create" | "span-create";
   timestamp: string;
   body: Record<string, unknown>;
 }
@@ -163,7 +164,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
 
   const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
 
-    // Parse data limits from plugin config with defaults
+  // Parse data limits from plugin config with defaults
   const dataLimits = {
     userInput: pluginConfig.limits?.userInput ?? 2000,
     assistantOutput: pluginConfig.limits?.assistantOutput ?? 10000,
@@ -194,14 +195,17 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     api.logger.info("[langfuse-tracer] Tracking all agents");
   }
 
-      api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
+  api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
   if (isDebug) {
     api.logger.info(`[langfuse-tracer] Debug mode enabled`);
   }
 
-  // Store run contexts keyed by runId
-  const runContexts = new Map<string, RunContext>();
-  const pendingPrompts = new Map<string, PendingPrompt>();
+  // Store active agent traces keyed by session key
+  const activeTraces = new Map<string, AgentTrace>();
+  // Store current generation for each runId
+  const activeGenerations = new Map<string, GenerationRecord>();
+  // Store pending tool calls keyed by runId+toolCallId
+  const pendingToolCalls = new Map<string, SpanRecord>();
 
   api.on("before_agent_start", (event, eventCtx) => {
     debug(
@@ -210,71 +214,133 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       `prompt=${event.prompt?.slice(0, 100)}...`,
     );
     
+    // Filter: only track specified agents if trackedAgents is configured
+    if (trackedAgents !== null && eventCtx.agentId && !trackedAgents.has(eventCtx.agentId)) {
+      debug(`[langfuse-tracer] [DEBUG] Skipping agent ${eventCtx.agentId} (not in trackedAgents)`);
+      return;
+    }
+    
     const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
-    pendingPrompts.set(key, {
-      prompt: event.prompt ?? "",
-      startedAt: Date.now(),
-    });
+    const traceId = randomId();
+    
+    // Create a new trace for this agent run
+    const trace: AgentTrace = {
+      traceId,
+      agentId: eventCtx.agentId,
+      sessionKey: eventCtx.sessionKey,
+      userInput: event.prompt ?? "",
+      startTime: Date.now(),
+      generations: [],
+    };
+    
+    activeTraces.set(key, trace);
+    debug(`[langfuse-tracer] [DEBUG] Created trace ${traceId} for ${key}`);
   });
 
-    // Capture LLM input (system prompt, history)
+  // Capture LLM input - start a new Generation observation
   api.on("llm_input", (event, eventCtx) => {
     debug(
       `[langfuse-tracer] [DEBUG] llm_input: ` +
       `runId=${event.runId}, model=${event.model}, provider=${event.provider}`,
     );
     
-    const ctx: RunContext = {
+    const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+    const trace = activeTraces.get(key);
+    if (!trace) {
+      debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping generation`);
+      return;
+    }
+    
+    const generationId = randomId();
+    
+    // Build input for this generation (system prompt + history)
+    const inputParts: string[] = [];
+    if (event.systemPrompt) {
+      inputParts.push(event.systemPrompt.slice(0, dataLimits.systemPrompt));
+    }
+    if (event.historyMessages && event.historyMessages.length > 0) {
+      inputParts.push(
+        `\n### Conversation History (${event.historyMessages.length} messages)\n` +
+        JSON.stringify(event.historyMessages, null, 2).slice(0, dataLimits.history)
+      );
+    }
+    
+    const generation: GenerationRecord = {
+      generationId,
       runId: event.runId,
-      sessionId: event.sessionId,
-      agentId: eventCtx.agentId,
-      sessionKey: eventCtx.sessionKey,
-      provider: event.provider,
       model: event.model,
+      provider: event.provider,
       systemPrompt: event.systemPrompt,
       historyMessages: event.historyMessages,
-      toolCalls: [],
-      llmInput: {
-        timestamp: Date.now(),
-        imagesCount: event.imagesCount,
-      },
+      startTime: Date.now(),
+      input: inputParts.join("\n"),
+      spans: [],
     };
-    runContexts.set(event.runId, ctx);
+    
+    activeGenerations.set(event.runId, generation);
+    trace.generations.push(generation);
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Created generation ${generationId} for trace ${trace.traceId}`,
+    );
   });
 
-    // Capture LLM output (usage stats)
+  // Capture LLM output - complete the Generation observation
   api.on("llm_output", (event, eventCtx) => {
     debug(
       `[langfuse-tracer] [DEBUG] llm_output: ` +
       `runId=${event.runId}, usage=${JSON.stringify(event.usage)}`,
     );
     
-    const ctx = runContexts.get(event.runId);
-    if (ctx) {
-      ctx.llmOutput = {
-        timestamp: Date.now(),
-        assistantTexts: event.assistantTexts,
-        usage: event.usage,
-      };
+    const generation = activeGenerations.get(event.runId);
+    if (!generation) {
+      debug(`[langfuse-tracer] [DEBUG] No active generation for runId ${event.runId}`);
+      return;
     }
+    
+    // Complete the generation with output and usage
+    generation.endTime = Date.now();
+    generation.output = event.assistantTexts.join("\n").slice(0, dataLimits.assistantOutput);
+    generation.usage = event.usage;
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Completed generation ${generation.generationId}, ` +
+      `duration=${generation.endTime - generation.startTime}ms, ` +
+      `spans=${generation.spans.length}`,
+    );
   });
 
-    // Capture tool calls
+  // Capture tool calls - create Span observations nested under the current Generation
   api.on("before_tool_call", (event, toolCtx) => {
     debug(
       `[langfuse-tracer] [DEBUG] before_tool_call: ` +
       `runId=${event.runId}, tool=${event.toolName}`,
     );
     
-    const ctx = event.runId ? runContexts.get(event.runId) : null;
-    if (ctx) {
-      ctx.toolCalls.push({
-        toolName: event.toolName,
-        toolCallId: event.toolCallId,
-        params: event.params,
-        timestamp: Date.now(),
-      });
+    const generation = event.runId ? activeGenerations.get(event.runId) : null;
+    if (!generation) {
+      debug(`[langfuse-tracer] [DEBUG] No active generation for tool call ${event.toolName}`);
+      return;
     }
+    
+    const spanId = randomId();
+    const spanKey = `${event.runId}:${event.toolCallId ?? spanId}`;
+    
+    const span: SpanRecord = {
+      spanId,
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+      startTime: Date.now(),
+      input: event.params,
+    };
+    
+    pendingToolCalls.set(spanKey, span);
+    generation.spans.push(span);
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Created span ${spanId} (${event.toolName}) ` +
+      `under generation ${generation.generationId}`,
+    );
   });
 
   api.on("after_tool_call", (event, toolCtx) => {
@@ -283,20 +349,31 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       `runId=${event.runId}, tool=${event.toolName}, durationMs=${event.durationMs}`,
     );
     
-    const ctx = event.runId ? runContexts.get(event.runId) : null;
-    if (ctx) {
-      const toolCall = ctx.toolCalls.find(
-        (t) => t.toolName === event.toolName && t.toolCallId === event.toolCallId,
-      );
-      if (toolCall) {
-        toolCall.result = event.result;
-        toolCall.error = event.error;
-        toolCall.durationMs = event.durationMs;
-      }
+    const spanKey = `${event.runId}:${event.toolCallId ?? ""}`;
+    const span = pendingToolCalls.get(spanKey);
+    if (!span) {
+      debug(`[langfuse-tracer] [DEBUG] No pending span for ${spanKey}`);
+      return;
     }
+    
+    // Complete the span
+    span.endTime = Date.now();
+    span.output = event.result;
+    span.error = event.error;
+    span.metadata = {
+      durationMs: event.durationMs,
+    };
+    
+    pendingToolCalls.delete(spanKey);
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Completed span ${span.spanId} (${event.toolName}), ` +
+      `duration=${event.durationMs}ms`,
+    );
   });
 
-    api.on("agent_end", async (event, eventCtx) => {
+  // Finalize and send the trace when agent ends
+  api.on("agent_end", async (event, eventCtx) => {
     const { agentId, sessionKey } = eventCtx;
     
     debug(
@@ -307,199 +384,142 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     // Filter: only track specified agents if trackedAgents is configured
     if (trackedAgents !== null && agentId && !trackedAgents.has(agentId)) {
       debug(`[langfuse-tracer] [DEBUG] Skipping agent ${agentId} (not in trackedAgents)`);
-      return; // Skip this agent
+      return;
     }
-
-    const { messages, success, durationMs, error } = event;
 
     const key = sessionKey ?? agentId ?? "default";
-    const pending = pendingPrompts.get(key);
-    pendingPrompts.delete(key);
-
-    // Find the run context for this agent turn (most recent one for this session)
-    let runCtx: RunContext | undefined;
-    for (const ctx of runContexts.values()) {
-      if (
-        ctx.agentId === agentId &&
-        ctx.sessionKey === sessionKey &&
-        (!runCtx || ctx.llmInput && ctx.llmInput.timestamp > (runCtx.llmInput?.timestamp ?? 0))
-      ) {
-        runCtx = ctx;
-      }
+    const trace = activeTraces.get(key);
+    if (!trace) {
+      debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping agent_end`);
+      return;
     }
-
+    
+    const { messages, success, durationMs, error } = event;
     const now = new Date().toISOString();
-    const startedAt = pending?.startedAt ?? (durationMs ? Date.now() - durationMs : Date.now());
-    const startTime = new Date(startedAt).toISOString();
+    const startTime = new Date(trace.startTime).toISOString();
 
-    // --- Extract user input ---
-    let userInput = pending?.prompt ?? "";
-    if (!userInput) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i] as MessageContent | undefined;
-        if (msg?.role === "user") {
-          userInput = extractText(msg.content, dataLimits.userInput);
-          break;
-        }
-      }
-    }
-
-    // --- Extract assistant output ---
-    let assistantOutput = "";
+    // Extract final assistant output from messages
+    let finalOutput = "";
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i] as MessageContent | undefined;
       if (msg?.role === "assistant") {
-        assistantOutput = extractText(msg.content, dataLimits.assistantOutput);
+        finalOutput = extractText(msg.content, dataLimits.assistantOutput);
         break;
       }
     }
 
-    // --- Build comprehensive input (user prompt + system prompt + history summary) ---
-    const inputParts: string[] = [];
+    // Build the batch: Trace + Generations + Spans (nested structure)
+    const batch: LangfuseBatchItem[] = [];
     
-    // User prompt
-    if (userInput) {
-      inputParts.push(`### User Input\n${userInput}`);
-    }
-
-    // System prompt from llm_input
-    if (runCtx?.systemPrompt) {
-      inputParts.push(`\n### System Prompt\n${runCtx.systemPrompt.slice(0, dataLimits.systemPrompt)}`);
-    }
-
-    // History messages summary
-    if (runCtx?.historyMessages && runCtx.historyMessages.length > 0) {
-      inputParts.push(
-        `\n### Conversation History (${runCtx.historyMessages.length} messages)\n` +
-          JSON.stringify(runCtx.historyMessages, null, 2).slice(0, dataLimits.history),
-      );
-    }
-
-    const fullInput = inputParts.join("\n");
-
-    // --- Build comprehensive output (assistant reply + tool calls) ---
-    const outputParts: string[] = [];
-
-    // Assistant text
-    if (assistantOutput) {
-      outputParts.push(`### Assistant Response\n${assistantOutput}`);
-    }
-
-    // Tool calls
-    if (runCtx?.toolCalls && runCtx.toolCalls.length > 0) {
-      outputParts.push(`\n### Tool Calls (${runCtx.toolCalls.length})`);
-      runCtx.toolCalls.forEach((tool, idx) => {
-        outputParts.push(
-          `\n#### ${idx + 1}. ${tool.toolName}` +
-            `\n- Duration: ${tool.durationMs ?? "?"}ms` +
-            `\n- Params: ${JSON.stringify(tool.params).slice(0, dataLimits.toolParams)}` +
-            (tool.error
-              ? `\n- Error: ${tool.error}`
-              : `\n- Result: ${JSON.stringify(tool.result).slice(0, dataLimits.toolResult)}`),
-        );
-      });
-    }
-
-    const fullOutput = outputParts.join("\n");
-
-    // --- Extract token usage (prefer from llm_output, fallback to message usage) ---
-    let usage: LangfuseUsage | undefined;
-    if (runCtx?.llmOutput?.usage) {
-      const u = runCtx.llmOutput.usage;
-      usage = {
-        input: u.input,
-        output: u.output,
-        unit: "TOKENS",
-      };
-    } else {
-      // Fallback to message usage
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i] as MessageContent | undefined;
-        if (msg?.role === "assistant" && msg.usage) {
-          const u = msg.usage;
-          usage = {
-            input: typeof u.input_tokens === "number" ? u.input_tokens : undefined,
-            output: typeof u.output_tokens === "number" ? u.output_tokens : undefined,
-            unit: "TOKENS",
-          };
-          break;
-        }
-      }
-    }
-
-    const traceId = randomId();
-    const generationId = randomId();
-    const batchItemId1 = randomId();
-    const batchItemId2 = randomId();
-
-    const batch: LangfuseBatchItem[] = [
-      {
-        id: batchItemId1,
-        type: "trace-create",
-        timestamp: now,
-        body: {
-          id: traceId,
-          name: "openclaw-agent-turn",
-          sessionId: sessionKey ?? undefined,
-          userId: agentId ?? "unknown",
-          tags: [
-            "openclaw",
-            agentId ?? "unknown",
-            runCtx?.provider || "unknown-provider",
-            runCtx?.model || "unknown-model",
-          ],
-          input: fullInput || undefined,
-          output: fullOutput || undefined,
-          metadata: {
-            success,
-            error: error ?? undefined,
-            messageCount: messages.length,
-            provider: runCtx?.provider,
-            model: runCtx?.model,
-            toolCallsCount: runCtx?.toolCalls.length ?? 0,
-            imagesCount: runCtx?.llmInput?.imagesCount ?? 0,
-            historyMessagesCount: runCtx?.historyMessages?.length ?? 0,
-          },
-          timestamp: startTime,
+    // Count total spans and generations for summary
+    let totalSpans = 0;
+    let totalGenerations = trace.generations.length;
+    trace.generations.forEach(gen => { totalSpans += gen.spans.length; });
+    
+    // Collect all providers and models
+    const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
+    const models = new Set(trace.generations.map(g => g.model).filter(Boolean));
+    
+    // 1. Create the Trace
+    batch.push({
+      id: randomId(),
+      type: "trace-create",
+      timestamp: now,
+      body: {
+        id: trace.traceId,
+        name: "openclaw-agent-run",
+        sessionId: sessionKey ?? undefined,
+        userId: agentId ?? "unknown",
+        tags: [
+          "openclaw",
+          agentId ?? "unknown",
+          ...Array.from(providers),
+          ...Array.from(models),
+        ],
+        input: trace.userInput.slice(0, dataLimits.userInput) || undefined,
+        output: finalOutput || undefined,
+        metadata: {
+          success,
+          error: error ?? undefined,
+          messageCount: messages.length,
+          totalGenerations,
+          totalToolCalls: totalSpans,
+          agentDurationMs: durationMs,
         },
+        timestamp: startTime,
       },
-      {
-        id: batchItemId2,
+    });
+    
+    // 2. Create each Generation observation
+    trace.generations.forEach((gen) => {
+      const genStartTime = new Date(gen.startTime).toISOString();
+      const genEndTime = gen.endTime ? new Date(gen.endTime).toISOString() : now;
+      
+      batch.push({
+        id: randomId(),
         type: "generation-create",
         timestamp: now,
         body: {
-          id: generationId,
-          traceId,
-          name: "llm-generation",
-          model: runCtx?.model,
-          startTime,
-          endTime: now,
-          input: fullInput || undefined,
-          output: fullOutput || undefined,
-          level: success ? "DEFAULT" : "ERROR",
-          statusMessage: error ?? undefined,
-          usage,
+          id: gen.generationId,
+          traceId: trace.traceId,
+          name: `llm-call-${gen.model ?? "unknown"}`,
+          model: gen.model,
+          startTime: genStartTime,
+          endTime: genEndTime,
+          input: gen.input || undefined,
+          output: gen.output || undefined,
+          usage: gen.usage ? {
+            input: gen.usage.input,
+            output: gen.usage.output,
+            unit: "TOKENS" as const,
+          } : undefined,
           metadata: {
-            durationMs,
-            messageCount: messages.length,
-            provider: runCtx?.provider,
-            runId: runCtx?.runId,
-            sessionId: runCtx?.sessionId,
-            toolCalls: runCtx?.toolCalls.map((t) => ({
-              name: t.toolName,
-              durationMs: t.durationMs,
-              error: t.error,
-            })),
+            provider: gen.provider,
+            runId: gen.runId,
+            toolCallsCount: gen.spans.length,
+            cacheRead: gen.usage?.cacheRead,
+            cacheWrite: gen.usage?.cacheWrite,
           },
         },
-      },
-    ];
-
-    // Clean up old run contexts (keep last 100)
-    if (runContexts.size > 100) {
-      const oldestKeys = Array.from(runContexts.keys()).slice(0, runContexts.size - 100);
-      oldestKeys.forEach((k) => runContexts.delete(k));
-    }
+      });
+      
+      // 3. Create each Span (tool call) under this generation
+      gen.spans.forEach((span) => {
+        const spanStartTime = new Date(span.startTime).toISOString();
+        const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+        
+        batch.push({
+          id: randomId(),
+          type: "span-create",
+          timestamp: now,
+          body: {
+            id: span.spanId,
+            traceId: trace.traceId,
+            parentObservationId: gen.generationId,  // Nest under generation
+            name: span.toolName,
+            startTime: spanStartTime,
+            endTime: spanEndTime,
+            input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
+            output: span.error 
+              ? `ERROR: ${span.error}` 
+              : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
+            level: span.error ? "ERROR" : "DEFAULT",
+            statusMessage: span.error ?? undefined,
+            metadata: span.metadata,
+          },
+        });
+      });
+    });
+    
+    // Cleanup
+    activeTraces.delete(key);
+    trace.generations.forEach(gen => activeGenerations.delete(gen.runId));
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Sending batch: ` +
+      `${totalGenerations} generations, ${totalSpans} spans, ` +
+      `${batch.length} total items`,
+    );
 
     try {
       const res = await fetch(`${baseUrl}/api/public/ingestion`, {
@@ -517,7 +537,8 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
         );
       } else {
         api.logger.info(
-          `[langfuse-tracer] Successfully sent trace for agent "${agentId}" (${messages.length} msgs, ${runCtx?.toolCalls.length ?? 0} tools)`,
+          `[langfuse-tracer] ✓ Sent trace ${trace.traceId} for agent "${agentId}": ` +
+          `${totalGenerations} generations, ${totalSpans} tool calls`,
         );
       }
     } catch (err) {
