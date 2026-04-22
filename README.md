@@ -8,13 +8,18 @@ A comprehensive tracing plugin for [OpenClaw](https://github.com/OpenClaw/opencl
 ## 🌟 Features
 
 ### Complete Observability
+
 - 📝 **Full System Prompts** - Captures complete system prompts including truncated AGENTS.md content (up to 20,000 chars)
 - 💬 **Conversation History** - Records conversation context with JSON formatting (up to 5,000 chars)
 - 🔧 **Tool Call Tracking** - Monitors all tool invocations with parameters, results, and execution time
 - 📊 **Token Usage** - Precise tracking of input/output tokens and cache hits/writes
 - ⏱️ **Performance Metrics** - Detailed timing data for agent runs and tool executions
+- 🔥 **Per-Iteration Tracking** - NEW! Monitor each LLM decision cycle separately with `agent_iteration_start`/`agent_iteration_end` hooks
+- 🔄 **Compaction Visibility** - NEW! Track context compression events with `before_compaction`/`after_compaction` hooks
+- 🏷️ **Tagged Inputs** - NEW! Clear section markers for system prompts, history, tool results, and outputs
 
 ### Production Ready
+
 - 🏠 **Self-Hosted** - All data stays in your infrastructure
 - 🚀 **Zero Dependencies** - Uses native `fetch` API, no npm packages required
 - ⚡ **Non-Blocking** - Asynchronous sending with error handling
@@ -23,29 +28,52 @@ A comprehensive tracing plugin for [OpenClaw](https://github.com/OpenClaw/opencl
 
 ## 📸 Screenshots
 
-### Langfuse Trace View
-Your OpenClaw agent interactions appear in Langfuse with complete context:
+### Langfuse Trace View (Updated Structure)
+
+Your OpenClaw agent interactions now appear in Langfuse with granular iteration tracking:
 
 ```
-Trace: openclaw-agent-turn
-├─ Input
-│  ├─ User Input: "Analyze Q1 sales data"
-│  ├─ System Prompt: "You are a personal assistant..."
-│  └─ Conversation History: [...previous messages]
+Trace: openclaw-agent-run
+├─ Generation: llm-call-initial
+│  ├─ Input:
+│  │  ├─ [INITIAL_SYSTEM_PROMPT] "You are a personal assistant..."
+│  │  ├─ [INITIAL_HISTORY] (5 messages)
+│  │  └─ [USER_PROMPT] "Analyze Q1 sales data"
+│  └─ Output: Cumulative response
 │
-├─ Output
-│  ├─ Assistant Response: "I'll analyze the data..."
-│  └─ Tool Calls
-│     ├─ 1. read (333ms) - Read IDENTITY.md
-│     ├─ 2. read (349ms) - Read USER.md  
-│     ├─ 3. exec (379ms) - Run SQL query
-│     └─ ... (results included)
+├─ Generation: iteration-1
+│  ├─ Input:
+│  │  ├─ [TOOL_RESULTS] (empty, first iteration)
+│  │  └─ [RECENT_HISTORY] (last 2 messages)
+│  ├─ Output: [ASSISTANT_OUTPUT] (decided: read IDENTITY.md, read USER.md)
+│  └─ Spans:
+│     ├─ read (333ms) - Read IDENTITY.md
+│     └─ read (349ms) - Read USER.md
 │
-└─ Metadata
-   ├─ Provider: amazon-bedrock
-   ├─ Model: claude-sonnet-4
-   ├─ Tokens: 57,298 (input: 52,101, output: 5,197)
-   └─ Tools: 6 calls
+├─ Generation: iteration-2
+│  ├─ Input:
+│  │  ├─ [TOOL_RESULTS] (2 results from iteration-1)
+│  │  └─ [RECENT_HISTORY] (last 2 messages)
+│  ├─ Output: [ASSISTANT_OUTPUT] (decided: exec SQL query)
+│  └─ Spans:
+│     └─ exec (379ms) - Run SQL query
+│
+├─ Span: compaction (if triggered)
+│  ├─ Input:
+│  │  ├─ [BEFORE_COMPACTION] (50 messages, full system prompt)
+│  │  └─ [AFTER_COMPACTION] (15 messages, re-injected AGENTS.md sections)
+│  └─ Output: "Messages: 50 → 15 (reduced 35)"
+│
+└─ Generation: iteration-3
+   ├─ Input:
+   │  ├─ [TOOL_RESULTS] (1 result from iteration-2)
+   │  └─ [RECENT_HISTORY] (last 2 messages)
+   ├─ Output: [ASSISTANT_OUTPUT] (final answer, no more tools)
+   └─ Metadata:
+      ├─ Provider: amazon-bedrock
+      ├─ Model: claude-sonnet-4
+      ├─ Per-iteration tokens: 2,345 input, 234 output
+      └─ Cache: 890 read, 0 write
 ```
 
 ## 🚀 Quick Start
@@ -91,6 +119,7 @@ openclaw plugins list | grep langfuse
 ```
 
 You should see:
+
 ```
 [langfuse-tracer] Tracking all agents
 [langfuse-tracer] Langfuse tracing enabled → http://langfuse-web:3000
@@ -157,24 +186,24 @@ openclaw gateway restart
 
 #### Required Settings
 
-| Config Key | Description | Example |
-|------------|-------------|---------|
+| Config Key           | Description                 | Example     |
+| -------------------- | --------------------------- | ----------- |
 | `langfuse.publicKey` | Langfuse project public key | `pk-lf-xxx` |
 | `langfuse.secretKey` | Langfuse project secret key | `sk-lf-xxx` |
 
 #### Optional Settings
 
-| Config Key | Description | Default |
-|------------|-------------|---------|
-| `langfuse.baseUrl` | Langfuse server URL | `http://172.21.0.1:3050` |
-| `logLevel` | Log level: `info` or `debug` | `info` |
-| `trackedAgents` | Array of agent IDs to trace (empty = all) | `[]` |
-| `limits.userInput` | Max chars for user input | `2000` |
-| `limits.assistantOutput` | Max chars for assistant output | `10000` |
-| `limits.systemPrompt` | Max chars for system prompt | `20000` |
-| `limits.history` | Max chars for conversation history (JSON) | `5000` |
-| `limits.toolParams` | Max chars for tool parameters | `500` |
-| `limits.toolResult` | Max chars for tool result | `1000` |
+| Config Key               | Description                               | Default                  |
+| ------------------------ | ----------------------------------------- | ------------------------ |
+| `langfuse.baseUrl`       | Langfuse server URL                       | `http://172.21.0.1:3050` |
+| `logLevel`               | Log level: `info` or `debug`              | `info`                   |
+| `trackedAgents`          | Array of agent IDs to trace (empty = all) | `[]`                     |
+| `limits.userInput`       | Max chars for user input                  | `2000`                   |
+| `limits.assistantOutput` | Max chars for assistant output            | `10000`                  |
+| `limits.systemPrompt`    | Max chars for system prompt               | `20000`                  |
+| `limits.history`         | Max chars for conversation history (JSON) | `5000`                   |
+| `limits.toolParams`      | Max chars for tool parameters             | `500`                    |
+| `limits.toolResult`      | Max chars for tool result                 | `1000`                   |
 
 ## 📊 What Gets Traced
 
@@ -195,11 +224,13 @@ Trace (one agent run)
 Due to OpenClaw's hook architecture, the plugin captures the agent run as a **single Generation** with all tool calls nested underneath. While the agent internally makes multiple LLM calls to decide which tools to use, these intermediate calls are not exposed through separate `llm_input`/`llm_output` hooks.
 
 This means:
+
 - ✅ You can see **all tool calls** with precise timing and parameters
 - ✅ You get **total token usage** (accumulated from all LLM calls)
 - ❌ You cannot see individual LLM decision cycles separately
 
 For example, an agent that reads files → analyzes → executes commands will show:
+
 - 1 Trace = entire agent run
 - 1 Generation = all LLM interactions combined
 - 7 Spans = each tool call (read × 2, exec × 2, process × 2, write × 1)
@@ -209,6 +240,7 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
 ### For Each Agent Turn
 
 #### 1. Trace Record
+
 - **Trace ID**: Unique identifier
 - **Session ID**: Groups related conversations
 - **User ID**: Agent identifier
@@ -229,10 +261,11 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
   - History messages count
 
 #### 2. Generation Record
+
 - **Generation ID**: Unique identifier
 - **Model**: Actual model used
 - **Timestamps**: Start and end times
-- **Token Usage**: 
+- **Token Usage**:
   - Input tokens
   - Output tokens
   - Cache read/write (if supported)
@@ -245,44 +278,52 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
 ### Tool Calls (3)
 
 #### 1. exec
+
 - Duration: 234ms
 - Params: {"command":"ls -la"}
 - Result: {"stdout":"total 48\ndrwxr-xr-x..."}
 
 #### 2. read
+
 - Duration: 156ms
 - Params: {"path":"IDENTITY.md"}
 - Result: "# Identity\n..."
 
 #### 3. execute_sql
+
 - Duration: 789ms
-- Params: {"query":"SELECT * FROM..."}
+- Params: {"query":"SELECT \* FROM..."}
 - Error: "Connection timeout"
 ```
 
 ## 🎯 Use Cases
 
 ### 1. Debugging Agent Behavior
+
 - View complete system prompts to understand how the agent was instructed
 - See exactly what context was available (AGENTS.md content, conversation history)
 - Trace tool execution flow and identify bottlenecks
 
 ### 2. Performance Optimization
+
 - Analyze token usage across different agents and models
 - Identify slow tool calls
 - Optimize system prompt length
 
 ### 3. Cost Tracking
+
 - Monitor token consumption per agent
 - Track which agents/conversations are most expensive
 - Analyze cache hit rates (if supported by provider)
 
 ### 4. Quality Assurance
+
 - Review agent responses in production
 - Identify failure patterns
 - Validate tool call accuracy
 
 ### 5. Compliance & Audit
+
 - Complete audit trail of agent interactions
 - Self-hosted data for privacy compliance
 - Searchable trace history
@@ -290,6 +331,7 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
 ## 🔍 Viewing Traces in Langfuse
 
 1. **Access Langfuse UI**
+
    ```
    http://your-langfuse-url:3000
    ```
@@ -320,27 +362,32 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
 ### No Traces Appearing
 
 1. **Check plugin is installed**
+
    ```bash
    openclaw plugins list | grep langfuse
    ```
 
 2. **Verify configuration**
+
    ```bash
    openclaw config get plugins.entries.langfuse-tracer.config
    ```
 
 3. **Enable debug mode**
+
    ```bash
    openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
    openclaw gateway restart
    ```
 
 4. **Check gateway logs**
+
    ```bash
    tail -f ~/.openclaw/logs/gateway-*.log | grep langfuse
    ```
 
    You should see:
+
    ```
    [langfuse-tracer] Tracking all agents
    [langfuse-tracer] Langfuse tracing enabled → http://...
@@ -370,11 +417,13 @@ Make sure agent IDs match exactly.
 ### Ingestion Failures
 
 Check logs for error messages:
+
 ```bash
 tail -100 ~/.openclaw/logs/gateway-*.log | grep "Ingestion failed"
 ```
 
 Common causes:
+
 - Incorrect credentials
 - Network connectivity issues
 - Langfuse server down
@@ -389,7 +438,7 @@ Common causes:
          │ Events:
          │ - before_agent_start
          │ - llm_input
-         │ - llm_output  
+         │ - llm_output
          │ - before_tool_call
          │ - after_tool_call
          │ - agent_end
@@ -430,14 +479,14 @@ To prevent oversized payloads, the plugin truncates data at configurable limits.
 
 #### Default Limits
 
-| Data Type | Default | Config Key |
-|-----------|---------|------------|
-| System prompt | 20,000 chars | `limits.systemPrompt` |
-| Conversation history | 5,000 chars | `limits.history` |
-| User input | 2,000 chars | `limits.userInput` |
-| Assistant output | 10,000 chars | `limits.assistantOutput` |
-| Tool parameters | 500 chars | `limits.toolParams` |
-| Tool result | 1,000 chars | `limits.toolResult` |
+| Data Type            | Default      | Config Key               |
+| -------------------- | ------------ | ------------------------ |
+| System prompt        | 20,000 chars | `limits.systemPrompt`    |
+| Conversation history | 5,000 chars  | `limits.history`         |
+| User input           | 2,000 chars  | `limits.userInput`       |
+| Assistant output     | 10,000 chars | `limits.assistantOutput` |
+| Tool parameters      | 500 chars    | `limits.toolParams`      |
+| Tool result          | 1,000 chars  | `limits.toolResult`      |
 
 #### Customizing Limits
 
@@ -455,6 +504,7 @@ openclaw gateway restart
 ```
 
 **Note**: Larger limits may result in:
+
 - Higher network bandwidth usage
 - Increased Langfuse database storage
 - Potential ingestion failures if payload exceeds Langfuse limits
@@ -462,16 +512,19 @@ openclaw gateway restart
 ## 🔐 Security & Privacy
 
 ### Data Retention
+
 - All data is sent to **your self-hosted** Langfuse instance
 - You control data retention policies
 - No data leaves your infrastructure
 
 ### Authentication
+
 - Uses Basic Auth (base64 encoded credentials)
 - Credentials stored securely in openclaw.json
 - Never logged by the plugin
 
 ### Data Sanitization
+
 - Consider sanitizing sensitive data in:
   - System prompts
   - Tool parameters
@@ -548,6 +601,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## 📊 Changelog
 
 ### v2026.4.7 (Current)
+
 - ✅ **Plugin-based configuration** - All settings managed via openclaw.json (no environment variables needed)
 - ✅ **Debug logging** - Configurable log level (`info` or `debug`) for troubleshooting
 - ✅ **Configurable data limits** - All truncation limits configurable via plugin config
@@ -560,6 +614,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - ✅ Zero npm dependencies
 
 ### v2026.3.26
+
 - Initial release with environment variable configuration
 
 ---

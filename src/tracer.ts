@@ -56,6 +56,8 @@ interface AgentTrace {
   userInput: string;  // Original user prompt from before_agent_start
   startTime: number;
   generations: GenerationRecord[];  // All LLM calls during this agent run
+  iterations: IterationRecord[];  // All iterations during this agent run
+  compactions: CompactionRecord[];  // All compactions during this agent run
 }
 
 // Represents one LLM generation (llm_input + llm_output pair)
@@ -78,6 +80,44 @@ interface GenerationRecord {
     total?: number;
   };
   spans: SpanRecord[];  // Tool calls that happened during this generation
+}
+
+// Represents one iteration (agent_iteration_start → agent_iteration_end)
+interface IterationRecord {
+  iterationId: string;
+  runId: string;
+  iterationNumber: number;
+  startTime: number;
+  endTime?: number;
+  toolResults?: unknown[];
+  recentMessages?: unknown[];  // Last 2 messages from history
+  assistantMessage?: unknown;
+  toolCalls?: Array<{
+    id?: string;
+    name: string;
+    arguments?: string;
+  }>;
+  usage?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
+  spans: SpanRecord[];  // Tool executions within this iteration
+}
+
+// Represents one compaction event
+interface CompactionRecord {
+  compactionId: string;
+  startTime: number;
+  endTime?: number;
+  messageCountBefore?: number;
+  messageCountAfter?: number;
+  systemPromptBefore?: string;
+  systemPromptAfter?: string;
+  historyBefore?: unknown[];
+  historyAfter?: unknown[];
 }
 
 // Represents one tool call (span observation)
@@ -200,14 +240,18 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     api.logger.info(`[langfuse-tracer] Debug mode enabled`);
   }
 
-  // Store active agent traces keyed by session key
+    // Store active agent traces keyed by session key
   const activeTraces = new Map<string, AgentTrace>();
   // Store current generation for each runId
   const activeGenerations = new Map<string, GenerationRecord>();
+  // Store current iteration for each runId
+  const activeIterations = new Map<string, IterationRecord>();
   // Store pending tool calls keyed by runId+toolCallId
   const pendingToolCalls = new Map<string, SpanRecord>();
+  // Store compaction context for each session
+  const pendingCompactions = new Map<string, CompactionRecord>();
 
-  api.on("before_agent_start", (event, eventCtx) => {
+    api.on("before_agent_start", (event, eventCtx) => {
     debug(
       `[langfuse-tracer] [DEBUG] before_agent_start: ` +
       `agentId=${eventCtx.agentId}, sessionKey=${eventCtx.sessionKey}, ` +
@@ -231,13 +275,15 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       userInput: event.prompt ?? "",
       startTime: Date.now(),
       generations: [],
+      iterations: [],
+      compactions: [],
     };
     
     activeTraces.set(key, trace);
     debug(`[langfuse-tracer] [DEBUG] Created trace ${traceId} for ${key}`);
   });
 
-  // Capture LLM input - start a new Generation observation
+      // Capture LLM input - start a new Generation observation
   api.on("llm_input", (event, eventCtx) => {
     debug(
       `[langfuse-tracer] [DEBUG] llm_input: ` +
@@ -253,16 +299,37 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     
     const generationId = randomId();
     
-    // Build input for this generation (system prompt + history)
-    const inputParts: string[] = [];
+    // 🏷️ Build structured JSON input for Langfuse parsing
+    const inputData: Record<string, unknown> = {};
+    
+    // INITIAL_SYSTEM_PROMPT as JSON key
     if (event.systemPrompt) {
-      inputParts.push(event.systemPrompt.slice(0, dataLimits.systemPrompt));
+      inputData.INITIAL_SYSTEM_PROMPT = event.systemPrompt.slice(0, dataLimits.systemPrompt);
     }
+    
+    // INITIAL_HISTORY as JSON key
     if (event.historyMessages && event.historyMessages.length > 0) {
-      inputParts.push(
-        `\n### Conversation History (${event.historyMessages.length} messages)\n` +
-        JSON.stringify(event.historyMessages, null, 2).slice(0, dataLimits.history)
-      );
+      inputData.INITIAL_HISTORY = {
+        messageCount: event.historyMessages.length,
+        messages: event.historyMessages,
+      };
+    }
+    
+    // USER_PROMPT as JSON key
+    if (event.prompt) {
+      inputData.USER_PROMPT = event.prompt.slice(0, dataLimits.userInput);
+    }
+    
+    // Convert to formatted JSON string
+    let inputStr: string;
+    try {
+      inputStr = JSON.stringify(inputData, null, 2);
+    } catch (err) {
+      // Fallback if stringify fails
+      inputStr = JSON.stringify({
+        error: "Failed to serialize input",
+        prompt: event.prompt?.slice(0, 100),
+      });
     }
     
     const generation: GenerationRecord = {
@@ -273,7 +340,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       systemPrompt: event.systemPrompt,
       historyMessages: event.historyMessages,
       startTime: Date.now(),
-      input: inputParts.join("\n"),
+      input: inputStr,
       spans: [],
     };
     
@@ -310,16 +377,22 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     );
   });
 
-  // Capture tool calls - create Span observations nested under the current Generation
+      // Capture tool calls - create Span observations nested under the current Generation or Iteration
   api.on("before_tool_call", (event, toolCtx) => {
     debug(
       `[langfuse-tracer] [DEBUG] before_tool_call: ` +
       `runId=${event.runId}, tool=${event.toolName}`,
     );
     
+    // Try to attach to active iteration first (for iteration 2+)
+    const iteration = event.runId ? activeIterations.get(event.runId) : null;
     const generation = event.runId ? activeGenerations.get(event.runId) : null;
-    if (!generation) {
-      debug(`[langfuse-tracer] [DEBUG] No active generation for tool call ${event.toolName}`);
+    
+    if (!iteration && !generation) {
+      debug(
+        `[langfuse-tracer] [DEBUG] No active iteration or generation for ` +
+        `tool call ${event.toolName}`,
+      );
       return;
     }
     
@@ -335,12 +408,21 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     };
     
     pendingToolCalls.set(spanKey, span);
-    generation.spans.push(span);
     
-    debug(
-      `[langfuse-tracer] [DEBUG] Created span ${spanId} (${event.toolName}) ` +
-      `under generation ${generation.generationId}`,
-    );
+    // Attach to iteration if exists (iteration 2+), otherwise to generation (iteration 1)
+    if (iteration) {
+      iteration.spans.push(span);
+      debug(
+        `[langfuse-tracer] [DEBUG] Created span ${spanId} (${event.toolName}) ` +
+        `under iteration ${iteration.iterationId}`,
+      );
+    } else if (generation) {
+      generation.spans.push(span);
+      debug(
+        `[langfuse-tracer] [DEBUG] Created span ${spanId} (${event.toolName}) ` +
+        `under generation ${generation.generationId} (iteration 1)`,
+      );
+    }
   });
 
   api.on("after_tool_call", (event, toolCtx) => {
@@ -364,11 +446,185 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       durationMs: event.durationMs,
     };
     
-    pendingToolCalls.delete(spanKey);
+        pendingToolCalls.delete(spanKey);
     
     debug(
       `[langfuse-tracer] [DEBUG] Completed span ${span.spanId} (${event.toolName}), ` +
       `duration=${event.durationMs}ms`,
+    );
+  });
+
+  // 🔥 Capture agent_iteration_start - beginning of each LLM iteration
+  api.on("agent_iteration_start", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] agent_iteration_start: ` +
+      `runId=${event.runId}, iterationId=${event.iterationId}, ` +
+      `messages=${event.messages?.length ?? 0}`,
+    );
+    
+    const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+    const trace = activeTraces.get(key);
+    if (!trace) {
+      debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping iteration_start`);
+      return;
+    }
+    
+    const iterationId = randomId();
+    
+    // Extract last 2 messages from history
+    const recentMessages = Array.isArray(event.messages) && event.messages.length > 0
+      ? event.messages.slice(-2)
+      : [];
+    
+    const iteration: IterationRecord = {
+      iterationId,
+      runId: event.runId,
+      iterationNumber: event.iterationId,
+      startTime: Date.now(),
+      toolResults: event.toolResults,
+      recentMessages,
+      spans: [],
+    };
+    
+    activeIterations.set(event.runId, iteration);
+    trace.iterations.push(iteration);
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Created iteration ${iterationId} ` +
+      `(#${event.iterationId}) for trace ${trace.traceId}`,
+    );
+  });
+
+        // 🔥 Capture agent_iteration_end - completion of each LLM iteration
+  api.on("agent_iteration_end", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] agent_iteration_end: ` +
+      `runId=${event.runId}, iterationId=${event.iterationId}, ` +
+      `toolCalls=${event.toolCalls?.length ?? 0}`,
+    );
+    
+    let iteration = activeIterations.get(event.runId);
+    
+    // Special case: iteration 1 without agent_iteration_start
+    // Don't create separate iteration record, merge with generation instead
+    if (!iteration && event.iterationId === 1) {
+      debug(
+        `[langfuse-tracer] [DEBUG] Iteration 1 without start event, ` +
+        `merging output with generation`,
+      );
+      
+      const generation = activeGenerations.get(event.runId);
+      if (generation) {
+        // Build structured JSON output for Langfuse parsing
+        const outputData: Record<string, unknown> = {};
+        
+        // ASSISTANT_OUTPUT as JSON key
+        if (event.assistantMessage) {
+          outputData.ASSISTANT_OUTPUT = event.assistantMessage;
+        }
+        
+        // TOOL_CALLS_PLANNED as JSON key
+        if (event.toolCalls && event.toolCalls.length > 0) {
+          outputData.TOOL_CALLS_PLANNED = event.toolCalls;
+        }
+        
+        // Convert to formatted JSON string
+        try {
+          generation.output = JSON.stringify(outputData, null, 2);
+        } catch (err) {
+          // Fallback if stringify fails
+          generation.output = `{"error": "Failed to serialize output", "toolCalls": ${event.toolCalls?.length ?? 0}}`;
+        }
+        
+        generation.usage = event.usage; // Update with actual usage
+        generation.endTime = Date.now();
+        
+        debug(
+          `[langfuse-tracer] [DEBUG] Merged iteration 1 output into generation ` +
+          `${generation.generationId}, toolCalls=${event.toolCalls?.length ?? 0}`,
+        );
+      }
+      return;
+    }
+    
+    // Normal case: iteration 2+
+    if (!iteration) {
+      debug(`[langfuse-tracer] [DEBUG] No active iteration for runId ${event.runId}`);
+      return;
+    }
+    
+    // Complete the iteration
+    iteration.endTime = Date.now();
+    iteration.assistantMessage = event.assistantMessage;
+    iteration.toolCalls = event.toolCalls;
+    iteration.usage = event.usage;
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Completed iteration ${iteration.iterationId}, ` +
+      `duration=${iteration.endTime - iteration.startTime}ms, ` +
+      `toolCalls=${event.toolCalls?.length ?? 0}`,
+    );
+  });
+
+  // 🔥 Capture before_compaction - context is about to be compressed
+  api.on("before_compaction", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] before_compaction: ` +
+      `sessionKey=${eventCtx.sessionKey}, messageCount=${event.messageCount}`,
+    );
+    
+    const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+    const trace = activeTraces.get(key);
+    if (!trace) {
+      debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping compaction`);
+      return;
+    }
+    
+    const compactionId = randomId();
+    
+    const compaction: CompactionRecord = {
+      compactionId,
+      startTime: Date.now(),
+      messageCountBefore: event.messageCount,
+      // Capture a snapshot of current state before compaction
+      systemPromptBefore: event.systemPrompt?.slice(0, dataLimits.systemPrompt),
+      historyBefore: event.messages,
+    };
+    
+    pendingCompactions.set(key, compaction);
+    trace.compactions.push(compaction);
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Started compaction ${compactionId} for trace ${trace.traceId}`,
+    );
+  });
+
+  // 🔥 Capture after_compaction - context has been compressed
+  api.on("after_compaction", (event, eventCtx) => {
+    debug(
+      `[langfuse-tracer] [DEBUG] after_compaction: ` +
+      `sessionKey=${eventCtx.sessionKey}, success=${event.success}`,
+    );
+    
+    const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+    const compaction = pendingCompactions.get(key);
+    if (!compaction) {
+      debug(`[langfuse-tracer] [DEBUG] No pending compaction for ${key}`);
+      return;
+    }
+    
+    // Complete the compaction record
+    compaction.endTime = Date.now();
+    compaction.messageCountAfter = event.messageCount;
+    compaction.systemPromptAfter = event.systemPrompt?.slice(0, dataLimits.systemPrompt);
+    compaction.historyAfter = event.messages;
+    
+    pendingCompactions.delete(key);
+    
+    debug(
+      `[langfuse-tracer] [DEBUG] Completed compaction ${compaction.compactionId}, ` +
+      `duration=${compaction.endTime - compaction.startTime}ms, ` +
+      `messages: ${compaction.messageCountBefore} → ${compaction.messageCountAfter}`,
     );
   });
 
@@ -408,13 +664,16 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       }
     }
 
-    // Build the batch: Trace + Generations + Spans (nested structure)
+        // Build the batch: Trace + Generations + Iterations + Compactions + Spans (nested structure)
     const batch: LangfuseBatchItem[] = [];
     
-    // Count total spans and generations for summary
+    // Count total spans, generations, iterations, and compactions for summary
     let totalSpans = 0;
     let totalGenerations = trace.generations.length;
+    let totalIterations = trace.iterations.length;
+    let totalCompactions = trace.compactions.length;
     trace.generations.forEach(gen => { totalSpans += gen.spans.length; });
+    trace.iterations.forEach(iter => { totalSpans += iter.spans.length; });
     
     // Collect all providers and models
     const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
@@ -438,11 +697,13 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
         ],
         input: trace.userInput.slice(0, dataLimits.userInput) || undefined,
         output: finalOutput || undefined,
-        metadata: {
+                metadata: {
           success,
           error: error ?? undefined,
           messageCount: messages.length,
           totalGenerations,
+          totalIterations,
+          totalCompactions,
           totalToolCalls: totalSpans,
           agentDurationMs: durationMs,
         },
@@ -508,16 +769,200 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
             metadata: span.metadata,
           },
         });
+    });
+    });
+    
+        // 3. Create each Iteration observation (agent_iteration_start → agent_iteration_end)
+    trace.iterations.forEach((iter) => {
+      const iterStartTime = new Date(iter.startTime).toISOString();
+      const iterEndTime = iter.endTime ? new Date(iter.endTime).toISOString() : now;
+      
+      // 🏷️ Build structured JSON input for Langfuse parsing
+      const inputData: Record<string, unknown> = {};
+      
+      // TOOL_RESULTS as JSON key
+      if (iter.toolResults && iter.toolResults.length > 0) {
+        inputData.TOOL_RESULTS = {
+          count: iter.toolResults.length,
+          results: iter.toolResults,
+        };
+      }
+      
+      // RECENT_HISTORY as JSON key
+      if (iter.recentMessages && iter.recentMessages.length > 0) {
+        inputData.RECENT_HISTORY = {
+          count: iter.recentMessages.length,
+          messages: iter.recentMessages,
+        };
+      }
+      
+      // Convert input to JSON string
+      let inputStr: string | undefined;
+      try {
+        inputStr = Object.keys(inputData).length > 0 
+          ? JSON.stringify(inputData, null, 2)
+          : undefined;
+      } catch (err) {
+        inputStr = JSON.stringify({ error: "Failed to serialize input" });
+      }
+      
+      // 🏷️ Build structured JSON output for Langfuse parsing
+      const outputData: Record<string, unknown> = {};
+      
+      // ASSISTANT_OUTPUT as JSON key
+      if (iter.assistantMessage) {
+        outputData.ASSISTANT_OUTPUT = iter.assistantMessage;
+      }
+      
+      // TOOL_CALLS_PLANNED as JSON key
+      if (iter.toolCalls && iter.toolCalls.length > 0) {
+        outputData.TOOL_CALLS_PLANNED = iter.toolCalls;
+      }
+      
+      // Convert output to JSON string
+      let outputStr: string | undefined;
+      try {
+        outputStr = Object.keys(outputData).length > 0
+          ? JSON.stringify(outputData, null, 2)
+          : undefined;
+      } catch (err) {
+        outputStr = JSON.stringify({ error: "Failed to serialize output" });
+      }
+      
+            
+      batch.push({
+        id: randomId(),
+        type: "generation-create",
+        timestamp: now,
+        body: {
+          id: iter.iterationId,
+          traceId: trace.traceId,
+          name: `iteration-${iter.iterationNumber}`,
+          startTime: iterStartTime,
+          endTime: iterEndTime,
+          input: inputStr,
+          output: outputStr,
+          usage: iter.usage ? {
+            input: iter.usage.input,
+            output: iter.usage.output,
+            unit: "TOKENS" as const,
+          } : undefined,
+          metadata: {
+            iterationType: "llm-iteration",
+            iterationNumber: iter.iterationNumber,
+            runId: iter.runId,
+            toolCallsPlanned: iter.toolCalls?.length ?? 0,
+            cacheRead: iter.usage?.cacheRead,
+            cacheWrite: iter.usage?.cacheWrite,
+          },
+        },
+      });
+      
+      // Attach tool execution spans under this iteration
+      iter.spans.forEach((span) => {
+        const spanStartTime = new Date(span.startTime).toISOString();
+        const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+        
+        batch.push({
+          id: randomId(),
+          type: "span-create",
+          timestamp: now,
+          body: {
+            id: span.spanId,
+            traceId: trace.traceId,
+            parentObservationId: iter.iterationId,  // Nest under iteration
+            name: span.toolName,
+            startTime: spanStartTime,
+            endTime: spanEndTime,
+            input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
+            output: span.error 
+              ? `ERROR: ${span.error}` 
+              : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
+            level: span.error ? "ERROR" : "DEFAULT",
+            statusMessage: span.error ?? undefined,
+            metadata: span.metadata,
+          },
+        });
+      });
+    });
+    
+        // 4. Create each Compaction observation
+    trace.compactions.forEach((comp) => {
+      const compStartTime = new Date(comp.startTime).toISOString();
+      const compEndTime = comp.endTime ? new Date(comp.endTime).toISOString() : now;
+      
+      // 🏷️ Build structured JSON for compaction changes
+      const inputData: Record<string, unknown> = {};
+      
+      // BEFORE_COMPACTION as JSON key
+      if (comp.messageCountBefore || comp.systemPromptBefore || comp.historyBefore) {
+        inputData.BEFORE_COMPACTION = {
+          messageCount: comp.messageCountBefore,
+          systemPrompt: comp.systemPromptBefore?.slice(0, 1000),
+          historyMessageCount: comp.historyBefore?.length,
+        };
+      }
+      
+      // AFTER_COMPACTION as JSON key
+      if (comp.messageCountAfter || comp.systemPromptAfter || comp.historyAfter) {
+        inputData.AFTER_COMPACTION = {
+          messageCount: comp.messageCountAfter,
+          systemPrompt: comp.systemPromptAfter?.slice(0, 1000),
+          historyMessageCount: comp.historyAfter?.length,
+          note: "AGENTS.md sections re-injected",
+        };
+      }
+      
+      // Convert to JSON string
+      let inputStr: string;
+      try {
+        inputStr = JSON.stringify(inputData, null, 2);
+      } catch (err) {
+        inputStr = JSON.stringify({ error: "Failed to serialize compaction data" });
+      }
+      
+      // Build output summary
+      const outputData = {
+        messageReduction: {
+          before: comp.messageCountBefore ?? 0,
+          after: comp.messageCountAfter ?? 0,
+          reduced: (comp.messageCountBefore ?? 0) - (comp.messageCountAfter ?? 0),
+        },
+      };
+      
+      batch.push({
+        id: randomId(),
+        type: "span-create",
+        timestamp: now,
+        body: {
+          id: comp.compactionId,
+          traceId: trace.traceId,
+          name: "compaction",
+          startTime: compStartTime,
+          endTime: compEndTime,
+          input: inputStr,
+          output: JSON.stringify(outputData, null, 2),
+          metadata: {
+            type: "context-compaction",
+            messageCountBefore: comp.messageCountBefore,
+            messageCountAfter: comp.messageCountAfter,
+            reduction: comp.messageCountBefore && comp.messageCountAfter
+              ? comp.messageCountBefore - comp.messageCountAfter
+              : undefined,
+          },
+        },
       });
     });
     
     // Cleanup
     activeTraces.delete(key);
     trace.generations.forEach(gen => activeGenerations.delete(gen.runId));
+    trace.iterations.forEach(iter => activeIterations.delete(iter.runId));
     
-    debug(
+        debug(
       `[langfuse-tracer] [DEBUG] Sending batch: ` +
-      `${totalGenerations} generations, ${totalSpans} spans, ` +
+      `${totalGenerations} generations, ${totalIterations} iterations, ` +
+      `${totalCompactions} compactions, ${totalSpans} spans, ` +
       `${batch.length} total items`,
     );
 
@@ -536,9 +981,10 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
           `[langfuse-tracer] Ingestion failed ${res.status}: ${text.slice(0, 200)}`,
         );
       } else {
-        api.logger.info(
+                api.logger.info(
           `[langfuse-tracer] ✓ Sent trace ${trace.traceId} for agent "${agentId}": ` +
-          `${totalGenerations} generations, ${totalSpans} tool calls`,
+          `${totalGenerations} generations, ${totalIterations} iterations, ` +
+          `${totalCompactions} compactions, ${totalSpans} tool calls`,
         );
       }
     } catch (err) {
