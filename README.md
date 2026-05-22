@@ -100,7 +100,14 @@ openclaw plugins install /path/to/langfuse-tracer -l
 openclaw gateway restart
 ```
 
-3. **Configure via openclaw.json**
+3. **⚠️ Enable conversation access (REQUIRED)**
+
+```bash
+# This is required for agent_end, llm_input, and llm_output hooks to work
+openclaw config set plugins.entries.langfuse-tracer.hooks.allowConversationAccess true
+```
+
+4. **Configure via openclaw.json**
 
 ```bash
 # Set your Langfuse credentials
@@ -112,7 +119,7 @@ openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "htt
 openclaw gateway restart
 ```
 
-4. **Verify installation**
+5. **Verify installation**
 
 ```bash
 openclaw plugins list | grep langfuse
@@ -127,6 +134,25 @@ You should see:
 
 ## ⚙️ Configuration
 
+### ⚠️ Required: Enable Conversation Access
+
+**IMPORTANT**: This plugin uses conversation access hooks (`agent_end`, `llm_input`, `llm_output`) that require explicit permission.
+
+```bash
+# This must be set for the plugin to work
+openclaw config set plugins.entries.langfuse-tracer.hooks.allowConversationAccess true
+```
+
+**Why is this required?**
+
+Conversation access hooks can read sensitive data:
+- Full conversation history
+- System prompts and agent instructions
+- User inputs and assistant outputs
+- Token usage and model information
+
+OpenClaw requires explicit permission to ensure you trust the plugin with this data.
+
 ### Plugin Configuration via openclaw.json
 
 All configuration is managed via `~/.openclaw/openclaw.json`:
@@ -137,6 +163,9 @@ All configuration is managed via `~/.openclaw/openclaw.json`:
     "entries": {
       "langfuse-tracer": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "config": {
           "logLevel": "info",
           "langfuse": {
@@ -163,22 +192,25 @@ All configuration is managed via `~/.openclaw/openclaw.json`:
 ### Using CLI
 
 ```bash
-# Set Langfuse credentials
+# STEP 1: Enable conversation access (REQUIRED)
+openclaw config set plugins.entries.langfuse-tracer.hooks.allowConversationAccess true
+
+# STEP 2: Set Langfuse credentials
 openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
 openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
 openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
 
-# Enable debug logging (optional)
+# STEP 3: Optional - Enable debug logging
 openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
 
-# Track specific agents (optional, empty = track all)
+# STEP 4: Optional - Track specific agents (empty = track all)
 openclaw config set plugins.entries.langfuse-tracer.config.trackedAgents '["prod-agent", "fais-agent"]'
 
-# Customize data limits (optional)
+# STEP 5: Optional - Customize data limits
 openclaw config set plugins.entries.langfuse-tracer.config.limits.userInput 5000
 openclaw config set plugins.entries.langfuse-tracer.config.limits.assistantOutput 20000
 
-# Restart gateway to apply changes
+# STEP 6: Restart gateway to apply changes
 openclaw gateway restart
 ```
 
@@ -361,26 +393,47 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
 
 ### No Traces Appearing
 
-1. **Check plugin is installed**
+1. **Check conversation access is enabled** (most common issue)
+
+   ```bash
+   openclaw config get plugins.entries.langfuse-tracer.hooks
+   ```
+   
+   Should show:
+   ```json
+   {
+     "allowConversationAccess": true
+   }
+   ```
+   
+   If not set or shows `Config path not found`, enable it:
+   ```bash
+   openclaw config set plugins.entries.langfuse-tracer.hooks.allowConversationAccess true
+   openclaw gateway restart
+   ```
+   
+   **Symptom**: You see `after_tool_call` logs but NO `agent_end` logs.
+
+2. **Check plugin is installed**
 
    ```bash
    openclaw plugins list | grep langfuse
    ```
 
-2. **Verify configuration**
+3. **Verify configuration**
 
    ```bash
    openclaw config get plugins.entries.langfuse-tracer.config
    ```
 
-3. **Enable debug mode**
+4. **Enable debug mode**
 
    ```bash
    openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
    openclaw gateway restart
    ```
 
-4. **Check gateway logs**
+5. **Check gateway logs**
 
    ```bash
    tail -f ~/.openclaw/logs/gateway-*.log | grep langfuse
@@ -391,14 +444,14 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
    ```
    [langfuse-tracer] Tracking all agents
    [langfuse-tracer] Langfuse tracing enabled → http://...
-   [langfuse-tracer] [DEBUG] before_agent_start: ...
+      [langfuse-tracer] [DEBUG] before_agent_start: ...
    [langfuse-tracer] [DEBUG] llm_input: ...
    [langfuse-tracer] [DEBUG] llm_output: ...
-   [langfuse-tracer] [DEBUG] agent_end: ...
+   [langfuse-tracer] [DEBUG] agent_end: ...    <-- This should appear!
    [langfuse-tracer] Successfully sent trace for agent "prod-agent" (...)
    ```
 
-5. **Test Langfuse connectivity**
+6. **Test Langfuse connectivity**
    ```bash
    curl http://langfuse-web:3000/api/public/health
    ```
