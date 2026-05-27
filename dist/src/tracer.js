@@ -1,0 +1,681 @@
+function extractText(content, maxLen) {
+    if (typeof content === "string") {
+        return content.slice(0, maxLen);
+    }
+    if (Array.isArray(content)) {
+        return content
+            .filter((c) => c?.type === "text" && typeof c.text === "string")
+            .map((c) => c.text)
+            .join("\n")
+            .slice(0, maxLen);
+    }
+    return "";
+}
+function randomId() {
+    return crypto.randomUUID();
+}
+export function setupLangfuseTracer(api) {
+    const pluginConfig = (api.pluginConfig ?? {});
+    // Setup logging
+    const logLevel = pluginConfig.logLevel ?? "info";
+    const isDebug = logLevel === "debug";
+    const debug = (message) => {
+        if (isDebug)
+            api.logger.info(message);
+    };
+    // Read credentials from plugin config only
+    const publicKey = pluginConfig.langfuse?.publicKey?.trim();
+    const secretKey = pluginConfig.langfuse?.secretKey?.trim();
+    const baseUrl = (pluginConfig.langfuse?.baseUrl?.trim()
+        ?? "http://172.21.0.1:3050").replace(/\/$/, "");
+    if (!publicKey || !secretKey) {
+        api.logger.info("[langfuse-tracer] Langfuse credentials not configured. " +
+            "Configure via openclaw.json:\n" +
+            "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey 'pk-lf-xxx'\n" +
+            "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey 'sk-lf-xxx'\n" +
+            "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl 'http://langfuse:3000'\n" +
+            "— tracing disabled");
+        return;
+    }
+    const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
+    // Parse data limits from plugin config with defaults
+    const dataLimits = {
+        userInput: pluginConfig.limits?.userInput ?? 2000,
+        assistantOutput: pluginConfig.limits?.assistantOutput ?? 10000,
+        systemPrompt: pluginConfig.limits?.systemPrompt ?? 20000,
+        history: pluginConfig.limits?.history ?? 5000,
+        toolParams: pluginConfig.limits?.toolParams ?? 500,
+        toolResult: pluginConfig.limits?.toolResult ?? 1000,
+    };
+    api.logger.info(`[langfuse-tracer] Data limits: ` +
+        `user=${dataLimits.userInput}, ` +
+        `assistant=${dataLimits.assistantOutput}, ` +
+        `system=${dataLimits.systemPrompt}, ` +
+        `history=${dataLimits.history}, ` +
+        `toolParams=${dataLimits.toolParams}, ` +
+        `toolResult=${dataLimits.toolResult}`);
+    // Parse tracked agents configuration
+    let trackedAgents = null; // null = track all agents
+    if (Array.isArray(pluginConfig.trackedAgents) && pluginConfig.trackedAgents.length > 0) {
+        trackedAgents = new Set(pluginConfig.trackedAgents);
+        api.logger.info(`[langfuse-tracer] Tracking specific agents: ${Array.from(trackedAgents).join(", ")}`);
+    }
+    else {
+        api.logger.info("[langfuse-tracer] Tracking all agents");
+    }
+    api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
+    if (isDebug) {
+        api.logger.info(`[langfuse-tracer] Debug mode enabled`);
+    }
+    // Store active agent traces keyed by session key
+    const activeTraces = new Map();
+    // Store current generation for each runId
+    const activeGenerations = new Map();
+    // Store current iteration for each runId
+    const activeIterations = new Map();
+    // Store pending tool calls keyed by runId+toolCallId
+    const pendingToolCalls = new Map();
+    // Store compaction context for each session
+    const pendingCompactions = new Map();
+    api.on("before_agent_start", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] before_agent_start: ` +
+            `agentId=${eventCtx.agentId}, sessionKey=${eventCtx.sessionKey}, ` +
+            `prompt=${event.prompt?.slice(0, 100)}...`);
+        // Filter: only track specified agents if trackedAgents is configured
+        if (trackedAgents !== null && eventCtx.agentId && !trackedAgents.has(eventCtx.agentId)) {
+            debug(`[langfuse-tracer] [DEBUG] Skipping agent ${eventCtx.agentId} (not in trackedAgents)`);
+            return;
+        }
+        const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+        const traceId = randomId();
+        // Create a new trace for this agent run
+        const trace = {
+            traceId,
+            agentId: eventCtx.agentId,
+            sessionKey: eventCtx.sessionKey,
+            userInput: event.prompt ?? "",
+            startTime: Date.now(),
+            generations: [],
+            iterations: [],
+            compactions: [],
+        };
+        activeTraces.set(key, trace);
+        debug(`[langfuse-tracer] [DEBUG] Created trace ${traceId} for ${key}`);
+    });
+    // Capture LLM input - start a new Generation observation
+    api.on("llm_input", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] llm_input: ` +
+            `runId=${event.runId}, model=${event.model}, provider=${event.provider}`);
+        const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+        const trace = activeTraces.get(key);
+        if (!trace) {
+            debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping generation`);
+            return;
+        }
+        const generationId = randomId();
+        // 🏷️ Build structured JSON input for Langfuse parsing
+        const inputData = {};
+        // INITIAL_SYSTEM_PROMPT as JSON key
+        if (event.systemPrompt) {
+            inputData.INITIAL_SYSTEM_PROMPT = event.systemPrompt.slice(0, dataLimits.systemPrompt);
+        }
+        // INITIAL_HISTORY as JSON key
+        if (event.historyMessages && event.historyMessages.length > 0) {
+            inputData.INITIAL_HISTORY = {
+                messageCount: event.historyMessages.length,
+                messages: event.historyMessages,
+            };
+        }
+        // USER_PROMPT as JSON key
+        if (event.prompt) {
+            inputData.USER_PROMPT = event.prompt.slice(0, dataLimits.userInput);
+        }
+        // Convert to formatted JSON string
+        let inputStr;
+        try {
+            inputStr = JSON.stringify(inputData, null, 2);
+        }
+        catch (err) {
+            // Fallback if stringify fails
+            inputStr = JSON.stringify({
+                error: "Failed to serialize input",
+                prompt: event.prompt?.slice(0, 100),
+            });
+        }
+        const generation = {
+            generationId,
+            runId: event.runId,
+            model: event.model,
+            provider: event.provider,
+            systemPrompt: event.systemPrompt,
+            historyMessages: event.historyMessages,
+            startTime: Date.now(),
+            input: inputStr,
+            spans: [],
+        };
+        activeGenerations.set(event.runId, generation);
+        trace.generations.push(generation);
+        debug(`[langfuse-tracer] [DEBUG] Created generation ${generationId} for trace ${trace.traceId}`);
+    });
+    // Capture LLM output - complete the Generation observation
+    api.on("llm_output", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] llm_output: ` +
+            `runId=${event.runId}, usage=${JSON.stringify(event.usage)}`);
+        const generation = activeGenerations.get(event.runId);
+        if (!generation) {
+            debug(`[langfuse-tracer] [DEBUG] No active generation for runId ${event.runId}`);
+            return;
+        }
+        // Complete the generation with output and usage
+        generation.endTime = Date.now();
+        generation.output = event.assistantTexts.join("\n").slice(0, dataLimits.assistantOutput);
+        generation.usage = event.usage;
+        debug(`[langfuse-tracer] [DEBUG] Completed generation ${generation.generationId}, ` +
+            `duration=${generation.endTime - generation.startTime}ms, ` +
+            `spans=${generation.spans.length}`);
+    });
+    // Capture tool calls - create Span observations nested under the current Generation or Iteration
+    api.on("before_tool_call", (event, toolCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] before_tool_call: ` +
+            `runId=${event.runId}, tool=${event.toolName}`);
+        // Try to attach to active iteration first (for iteration 2+)
+        const iteration = event.runId ? activeIterations.get(event.runId) : null;
+        const generation = event.runId ? activeGenerations.get(event.runId) : null;
+        if (!iteration && !generation) {
+            debug(`[langfuse-tracer] [DEBUG] No active iteration or generation for ` +
+                `tool call ${event.toolName}`);
+            return;
+        }
+        const spanId = randomId();
+        const spanKey = `${event.runId}:${event.toolCallId ?? spanId}`;
+        const span = {
+            spanId,
+            toolName: event.toolName,
+            toolCallId: event.toolCallId,
+            startTime: Date.now(),
+            input: event.params,
+        };
+        pendingToolCalls.set(spanKey, span);
+        // Attach to iteration if exists (iteration 2+), otherwise to generation (iteration 1)
+        if (iteration) {
+            iteration.spans.push(span);
+            debug(`[langfuse-tracer] [DEBUG] Created span ${spanId} (${event.toolName}) ` +
+                `under iteration ${iteration.iterationId}`);
+        }
+        else if (generation) {
+            generation.spans.push(span);
+            debug(`[langfuse-tracer] [DEBUG] Created span ${spanId} (${event.toolName}) ` +
+                `under generation ${generation.generationId} (iteration 1)`);
+        }
+    });
+    api.on("after_tool_call", (event, toolCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] after_tool_call: ` +
+            `runId=${event.runId}, tool=${event.toolName}, durationMs=${event.durationMs}`);
+        const spanKey = `${event.runId}:${event.toolCallId ?? ""}`;
+        const span = pendingToolCalls.get(spanKey);
+        if (!span) {
+            debug(`[langfuse-tracer] [DEBUG] No pending span for ${spanKey}`);
+            return;
+        }
+        // Complete the span
+        span.endTime = Date.now();
+        span.output = event.result;
+        span.error = event.error;
+        span.metadata = {
+            durationMs: event.durationMs,
+        };
+        pendingToolCalls.delete(spanKey);
+        debug(`[langfuse-tracer] [DEBUG] Completed span ${span.spanId} (${event.toolName}), ` +
+            `duration=${event.durationMs}ms`);
+    });
+    // 🔥 Capture agent_iteration_start - beginning of each LLM iteration
+    api.on("agent_iteration_start", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] agent_iteration_start: ` +
+            `runId=${event.runId}, iterationId=${event.iterationId}, ` +
+            `messages=${event.messages?.length ?? 0}`);
+        const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+        const trace = activeTraces.get(key);
+        if (!trace) {
+            debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping iteration_start`);
+            return;
+        }
+        const iterationId = randomId();
+        // Extract last 2 messages from history
+        const recentMessages = Array.isArray(event.messages) && event.messages.length > 0
+            ? event.messages.slice(-2)
+            : [];
+        const iteration = {
+            iterationId,
+            runId: event.runId,
+            iterationNumber: event.iterationId,
+            startTime: Date.now(),
+            toolResults: event.toolResults,
+            recentMessages,
+            spans: [],
+        };
+        activeIterations.set(event.runId, iteration);
+        trace.iterations.push(iteration);
+        debug(`[langfuse-tracer] [DEBUG] Created iteration ${iterationId} ` +
+            `(#${event.iterationId}) for trace ${trace.traceId}`);
+    });
+    // 🔥 Capture agent_iteration_end - completion of each LLM iteration
+    api.on("agent_iteration_end", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] agent_iteration_end: ` +
+            `runId=${event.runId}, iterationId=${event.iterationId}, ` +
+            `toolCalls=${event.toolCalls?.length ?? 0}`);
+        let iteration = activeIterations.get(event.runId);
+        // Special case: iteration 1 without agent_iteration_start
+        // Don't create separate iteration record, merge with generation instead
+        if (!iteration && event.iterationId === 1) {
+            debug(`[langfuse-tracer] [DEBUG] Iteration 1 without start event, ` +
+                `merging output with generation`);
+            const generation = activeGenerations.get(event.runId);
+            if (generation) {
+                // Build structured JSON output for Langfuse parsing
+                const outputData = {};
+                // ASSISTANT_OUTPUT as JSON key
+                if (event.assistantMessage) {
+                    outputData.ASSISTANT_OUTPUT = event.assistantMessage;
+                }
+                // TOOL_CALLS_PLANNED as JSON key
+                if (event.toolCalls && event.toolCalls.length > 0) {
+                    outputData.TOOL_CALLS_PLANNED = event.toolCalls;
+                }
+                // Convert to formatted JSON string
+                try {
+                    generation.output = JSON.stringify(outputData, null, 2);
+                }
+                catch (err) {
+                    // Fallback if stringify fails
+                    generation.output = `{"error": "Failed to serialize output", "toolCalls": ${event.toolCalls?.length ?? 0}}`;
+                }
+                generation.usage = event.usage; // Update with actual usage
+                generation.endTime = Date.now();
+                debug(`[langfuse-tracer] [DEBUG] Merged iteration 1 output into generation ` +
+                    `${generation.generationId}, toolCalls=${event.toolCalls?.length ?? 0}`);
+            }
+            return;
+        }
+        // Normal case: iteration 2+
+        if (!iteration) {
+            debug(`[langfuse-tracer] [DEBUG] No active iteration for runId ${event.runId}`);
+            return;
+        }
+        // Complete the iteration
+        iteration.endTime = Date.now();
+        iteration.assistantMessage = event.assistantMessage;
+        iteration.toolCalls = event.toolCalls;
+        iteration.usage = event.usage;
+        debug(`[langfuse-tracer] [DEBUG] Completed iteration ${iteration.iterationId}, ` +
+            `duration=${iteration.endTime - iteration.startTime}ms, ` +
+            `toolCalls=${event.toolCalls?.length ?? 0}`);
+    });
+    // 🔥 Capture before_compaction - context is about to be compressed
+    api.on("before_compaction", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] before_compaction: ` +
+            `sessionKey=${eventCtx.sessionKey}, messageCount=${event.messageCount}`);
+        const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+        const trace = activeTraces.get(key);
+        if (!trace) {
+            debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping compaction`);
+            return;
+        }
+        const compactionId = randomId();
+        const compaction = {
+            compactionId,
+            startTime: Date.now(),
+            messageCountBefore: event.messageCount,
+            // Capture a snapshot of current state before compaction
+            systemPromptBefore: event.systemPrompt?.slice(0, dataLimits.systemPrompt),
+            historyBefore: event.messages,
+        };
+        pendingCompactions.set(key, compaction);
+        trace.compactions.push(compaction);
+        debug(`[langfuse-tracer] [DEBUG] Started compaction ${compactionId} for trace ${trace.traceId}`);
+    });
+    // 🔥 Capture after_compaction - context has been compressed
+    api.on("after_compaction", (event, eventCtx) => {
+        debug(`[langfuse-tracer] [DEBUG] after_compaction: ` +
+            `sessionKey=${eventCtx.sessionKey}, success=${event.success}`);
+        const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+        const compaction = pendingCompactions.get(key);
+        if (!compaction) {
+            debug(`[langfuse-tracer] [DEBUG] No pending compaction for ${key}`);
+            return;
+        }
+        // Complete the compaction record
+        compaction.endTime = Date.now();
+        compaction.messageCountAfter = event.messageCount;
+        compaction.systemPromptAfter = event.systemPrompt?.slice(0, dataLimits.systemPrompt);
+        compaction.historyAfter = event.messages;
+        pendingCompactions.delete(key);
+        debug(`[langfuse-tracer] [DEBUG] Completed compaction ${compaction.compactionId}, ` +
+            `duration=${compaction.endTime - compaction.startTime}ms, ` +
+            `messages: ${compaction.messageCountBefore} → ${compaction.messageCountAfter}`);
+    });
+    // Finalize and send the trace when agent ends
+    api.on("agent_end", async (event, eventCtx) => {
+        const { agentId, sessionKey } = eventCtx;
+        debug(`[langfuse-tracer] [DEBUG] agent_end: ` +
+            `agentId=${agentId}, sessionKey=${sessionKey}, success=${event.success}, messages=${event.messages.length}`);
+        // Filter: only track specified agents if trackedAgents is configured
+        if (trackedAgents !== null && agentId && !trackedAgents.has(agentId)) {
+            debug(`[langfuse-tracer] [DEBUG] Skipping agent ${agentId} (not in trackedAgents)`);
+            return;
+        }
+        const key = sessionKey ?? agentId ?? "default";
+        const trace = activeTraces.get(key);
+        if (!trace) {
+            debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping agent_end`);
+            return;
+        }
+        const { messages, success, durationMs, error } = event;
+        const now = new Date().toISOString();
+        const startTime = new Date(trace.startTime).toISOString();
+        // Extract final assistant output from messages
+        let finalOutput = "";
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (msg?.role === "assistant") {
+                finalOutput = extractText(msg.content, dataLimits.assistantOutput);
+                break;
+            }
+        }
+        // Build the batch: Trace + Generations + Iterations + Compactions + Spans (nested structure)
+        const batch = [];
+        // Count total spans, generations, iterations, and compactions for summary
+        let totalSpans = 0;
+        let totalGenerations = trace.generations.length;
+        let totalIterations = trace.iterations.length;
+        let totalCompactions = trace.compactions.length;
+        trace.generations.forEach(gen => { totalSpans += gen.spans.length; });
+        trace.iterations.forEach(iter => { totalSpans += iter.spans.length; });
+        // Collect all providers and models
+        const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
+        const models = new Set(trace.generations.map(g => g.model).filter(Boolean));
+        // 1. Create the Trace
+        batch.push({
+            id: randomId(),
+            type: "trace-create",
+            timestamp: now,
+            body: {
+                id: trace.traceId,
+                name: "openclaw-agent-run",
+                sessionId: sessionKey ?? undefined,
+                userId: agentId ?? "unknown",
+                tags: [
+                    "openclaw",
+                    agentId ?? "unknown",
+                    ...Array.from(providers),
+                    ...Array.from(models),
+                ],
+                input: trace.userInput.slice(0, dataLimits.userInput) || undefined,
+                output: finalOutput || undefined,
+                metadata: {
+                    success,
+                    error: error ?? undefined,
+                    messageCount: messages.length,
+                    totalGenerations,
+                    totalIterations,
+                    totalCompactions,
+                    totalToolCalls: totalSpans,
+                    agentDurationMs: durationMs,
+                },
+                timestamp: startTime,
+            },
+        });
+        // 2. Create each Generation observation
+        trace.generations.forEach((gen) => {
+            const genStartTime = new Date(gen.startTime).toISOString();
+            const genEndTime = gen.endTime ? new Date(gen.endTime).toISOString() : now;
+            batch.push({
+                id: randomId(),
+                type: "generation-create",
+                timestamp: now,
+                body: {
+                    id: gen.generationId,
+                    traceId: trace.traceId,
+                    name: `llm-call-${gen.model ?? "unknown"}`,
+                    model: gen.model,
+                    startTime: genStartTime,
+                    endTime: genEndTime,
+                    input: gen.input || undefined,
+                    output: gen.output || undefined,
+                    usage: gen.usage ? {
+                        input: gen.usage.input,
+                        output: gen.usage.output,
+                        unit: "TOKENS",
+                    } : undefined,
+                    metadata: {
+                        provider: gen.provider,
+                        runId: gen.runId,
+                        toolCallsCount: gen.spans.length,
+                        cacheRead: gen.usage?.cacheRead,
+                        cacheWrite: gen.usage?.cacheWrite,
+                    },
+                },
+            });
+            // 3. Create each Span (tool call) under this generation
+            gen.spans.forEach((span) => {
+                const spanStartTime = new Date(span.startTime).toISOString();
+                const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+                batch.push({
+                    id: randomId(),
+                    type: "span-create",
+                    timestamp: now,
+                    body: {
+                        id: span.spanId,
+                        traceId: trace.traceId,
+                        parentObservationId: gen.generationId, // Nest under generation
+                        name: span.toolName,
+                        startTime: spanStartTime,
+                        endTime: spanEndTime,
+                        input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
+                        output: span.error
+                            ? `ERROR: ${span.error}`
+                            : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
+                        level: span.error ? "ERROR" : "DEFAULT",
+                        statusMessage: span.error ?? undefined,
+                        metadata: span.metadata,
+                    },
+                });
+            });
+        });
+        // 3. Create each Iteration observation (agent_iteration_start → agent_iteration_end)
+        trace.iterations.forEach((iter) => {
+            const iterStartTime = new Date(iter.startTime).toISOString();
+            const iterEndTime = iter.endTime ? new Date(iter.endTime).toISOString() : now;
+            // 🏷️ Build structured JSON input for Langfuse parsing
+            const inputData = {};
+            // TOOL_RESULTS as JSON key
+            if (iter.toolResults && iter.toolResults.length > 0) {
+                inputData.TOOL_RESULTS = {
+                    count: iter.toolResults.length,
+                    results: iter.toolResults,
+                };
+            }
+            // RECENT_HISTORY as JSON key
+            if (iter.recentMessages && iter.recentMessages.length > 0) {
+                inputData.RECENT_HISTORY = {
+                    count: iter.recentMessages.length,
+                    messages: iter.recentMessages,
+                };
+            }
+            // Convert input to JSON string
+            let inputStr;
+            try {
+                inputStr = Object.keys(inputData).length > 0
+                    ? JSON.stringify(inputData, null, 2)
+                    : undefined;
+            }
+            catch (err) {
+                inputStr = JSON.stringify({ error: "Failed to serialize input" });
+            }
+            // 🏷️ Build structured JSON output for Langfuse parsing
+            const outputData = {};
+            // ASSISTANT_OUTPUT as JSON key
+            if (iter.assistantMessage) {
+                outputData.ASSISTANT_OUTPUT = iter.assistantMessage;
+            }
+            // TOOL_CALLS_PLANNED as JSON key
+            if (iter.toolCalls && iter.toolCalls.length > 0) {
+                outputData.TOOL_CALLS_PLANNED = iter.toolCalls;
+            }
+            // Convert output to JSON string
+            let outputStr;
+            try {
+                outputStr = Object.keys(outputData).length > 0
+                    ? JSON.stringify(outputData, null, 2)
+                    : undefined;
+            }
+            catch (err) {
+                outputStr = JSON.stringify({ error: "Failed to serialize output" });
+            }
+            batch.push({
+                id: randomId(),
+                type: "generation-create",
+                timestamp: now,
+                body: {
+                    id: iter.iterationId,
+                    traceId: trace.traceId,
+                    name: `iteration-${iter.iterationNumber}`,
+                    startTime: iterStartTime,
+                    endTime: iterEndTime,
+                    input: inputStr,
+                    output: outputStr,
+                    usage: iter.usage ? {
+                        input: iter.usage.input,
+                        output: iter.usage.output,
+                        unit: "TOKENS",
+                    } : undefined,
+                    metadata: {
+                        iterationType: "llm-iteration",
+                        iterationNumber: iter.iterationNumber,
+                        runId: iter.runId,
+                        toolCallsPlanned: iter.toolCalls?.length ?? 0,
+                        cacheRead: iter.usage?.cacheRead,
+                        cacheWrite: iter.usage?.cacheWrite,
+                    },
+                },
+            });
+            // Attach tool execution spans under this iteration
+            iter.spans.forEach((span) => {
+                const spanStartTime = new Date(span.startTime).toISOString();
+                const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+                batch.push({
+                    id: randomId(),
+                    type: "span-create",
+                    timestamp: now,
+                    body: {
+                        id: span.spanId,
+                        traceId: trace.traceId,
+                        parentObservationId: iter.iterationId, // Nest under iteration
+                        name: span.toolName,
+                        startTime: spanStartTime,
+                        endTime: spanEndTime,
+                        input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
+                        output: span.error
+                            ? `ERROR: ${span.error}`
+                            : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
+                        level: span.error ? "ERROR" : "DEFAULT",
+                        statusMessage: span.error ?? undefined,
+                        metadata: span.metadata,
+                    },
+                });
+            });
+        });
+        // 4. Create each Compaction observation
+        trace.compactions.forEach((comp) => {
+            const compStartTime = new Date(comp.startTime).toISOString();
+            const compEndTime = comp.endTime ? new Date(comp.endTime).toISOString() : now;
+            // 🏷️ Build structured JSON for compaction changes
+            const inputData = {};
+            // BEFORE_COMPACTION as JSON key
+            if (comp.messageCountBefore || comp.systemPromptBefore || comp.historyBefore) {
+                inputData.BEFORE_COMPACTION = {
+                    messageCount: comp.messageCountBefore,
+                    systemPrompt: comp.systemPromptBefore?.slice(0, 1000),
+                    historyMessageCount: comp.historyBefore?.length,
+                };
+            }
+            // AFTER_COMPACTION as JSON key
+            if (comp.messageCountAfter || comp.systemPromptAfter || comp.historyAfter) {
+                inputData.AFTER_COMPACTION = {
+                    messageCount: comp.messageCountAfter,
+                    systemPrompt: comp.systemPromptAfter?.slice(0, 1000),
+                    historyMessageCount: comp.historyAfter?.length,
+                    note: "AGENTS.md sections re-injected",
+                };
+            }
+            // Convert to JSON string
+            let inputStr;
+            try {
+                inputStr = JSON.stringify(inputData, null, 2);
+            }
+            catch (err) {
+                inputStr = JSON.stringify({ error: "Failed to serialize compaction data" });
+            }
+            // Build output summary
+            const outputData = {
+                messageReduction: {
+                    before: comp.messageCountBefore ?? 0,
+                    after: comp.messageCountAfter ?? 0,
+                    reduced: (comp.messageCountBefore ?? 0) - (comp.messageCountAfter ?? 0),
+                },
+            };
+            batch.push({
+                id: randomId(),
+                type: "span-create",
+                timestamp: now,
+                body: {
+                    id: comp.compactionId,
+                    traceId: trace.traceId,
+                    name: "compaction",
+                    startTime: compStartTime,
+                    endTime: compEndTime,
+                    input: inputStr,
+                    output: JSON.stringify(outputData, null, 2),
+                    metadata: {
+                        type: "context-compaction",
+                        messageCountBefore: comp.messageCountBefore,
+                        messageCountAfter: comp.messageCountAfter,
+                        reduction: comp.messageCountBefore && comp.messageCountAfter
+                            ? comp.messageCountBefore - comp.messageCountAfter
+                            : undefined,
+                    },
+                },
+            });
+        });
+        // Cleanup
+        activeTraces.delete(key);
+        trace.generations.forEach(gen => activeGenerations.delete(gen.runId));
+        trace.iterations.forEach(iter => activeIterations.delete(iter.runId));
+        debug(`[langfuse-tracer] [DEBUG] Sending batch: ` +
+            `${totalGenerations} generations, ${totalIterations} iterations, ` +
+            `${totalCompactions} compactions, ${totalSpans} spans, ` +
+            `${batch.length} total items`);
+        try {
+            const res = await fetch(`${baseUrl}/api/public/ingestion`, {
+                method: "POST",
+                headers: {
+                    Authorization: authHeader,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ batch }),
+            });
+            if (!res.ok) {
+                const text = await res.text().catch(() => "");
+                api.logger.warn(`[langfuse-tracer] Ingestion failed ${res.status}: ${text.slice(0, 200)}`);
+            }
+            else {
+                api.logger.info(`[langfuse-tracer] ✓ Sent trace ${trace.traceId} for agent "${agentId}": ` +
+                    `${totalGenerations} generations, ${totalIterations} iterations, ` +
+                    `${totalCompactions} compactions, ${totalSpans} tool calls`);
+            }
+        }
+        catch (err) {
+            api.logger.warn(`[langfuse-tracer] Fetch error: ${String(err)}`);
+        }
+    });
+}
+//# sourceMappingURL=tracer.js.map

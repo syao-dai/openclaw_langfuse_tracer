@@ -12,11 +12,37 @@
   ],
   "author": "",
   "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./api.js": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js"
+    }
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
   "dependencies": {},
-  "openclaw": {
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  },
+    "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ],
+    "hooks": {},
     "release": {
       "publishToNpm": false
     }
