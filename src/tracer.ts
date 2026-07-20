@@ -172,6 +172,27 @@ function randomId(): string {
   return crypto.randomUUID();
 }
 
+/**
+ * OpenClaw can re-invoke a plugin's setup() mid-session (e.g. when a subagent
+ * spawn forces a plugin registry reload) without the process restarting. A
+ * plain module-level `new Map()` would silently reset on that re-invocation
+ * and orphan any trace created before the reload. Symbol.for() keys resolve
+ * through the global symbol registry, so the same Map instance is reused
+ * across setup() calls within one process even though a fresh module closure
+ * runs each time.
+ */
+function resolveGlobalMap<TKey, TValue>(key: string): Map<TKey, TValue> {
+  const globalStore = globalThis as Record<PropertyKey, unknown>;
+  const symbolKey = Symbol.for(key);
+  const existing = globalStore[symbolKey];
+  if (existing instanceof Map) {
+    return existing as Map<TKey, TValue>;
+  }
+  const created = new Map<TKey, TValue>();
+  globalStore[symbolKey] = created;
+  return created;
+}
+
 export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   const pluginConfig = (api.pluginConfig ?? {}) as PluginConfig;
   
@@ -241,15 +262,23 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   }
 
     // Store active agent traces keyed by session key
-  const activeTraces = new Map<string, AgentTrace>();
+  const activeTraces = resolveGlobalMap<string, AgentTrace>("openclaw.langfuse-tracer.activeTraces");
   // Store current generation for each runId
-  const activeGenerations = new Map<string, GenerationRecord>();
+  const activeGenerations = resolveGlobalMap<string, GenerationRecord>(
+    "openclaw.langfuse-tracer.activeGenerations",
+  );
   // Store current iteration for each runId
-  const activeIterations = new Map<string, IterationRecord>();
+  const activeIterations = resolveGlobalMap<string, IterationRecord>(
+    "openclaw.langfuse-tracer.activeIterations",
+  );
   // Store pending tool calls keyed by runId+toolCallId
-  const pendingToolCalls = new Map<string, SpanRecord>();
+  const pendingToolCalls = resolveGlobalMap<string, SpanRecord>(
+    "openclaw.langfuse-tracer.pendingToolCalls",
+  );
   // Store compaction context for each session
-  const pendingCompactions = new Map<string, CompactionRecord>();
+  const pendingCompactions = resolveGlobalMap<string, CompactionRecord>(
+    "openclaw.langfuse-tracer.pendingCompactions",
+  );
 
     api.on("before_agent_start", (event, eventCtx) => {
     debug(
@@ -656,12 +685,52 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
 
     // Extract final assistant output from messages
     let finalOutput = "";
+    let finalAssistantMessage: MessageContent | undefined;
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i] as MessageContent | undefined;
       if (msg?.role === "assistant") {
         finalOutput = extractText(msg.content, dataLimits.assistantOutput);
+        finalAssistantMessage = msg;
         break;
       }
+    }
+
+    // 🔥 Solution A: Complete any pending iteration that didn't fire agent_iteration_end
+    // This happens when the final LLM response has no tool calls
+    const lastIteration = trace.iterations[trace.iterations.length - 1];
+    if (lastIteration && !lastIteration.endTime) {
+      debug(
+        `[langfuse-tracer] [DEBUG] Completing final iteration ${lastIteration.iterationId} ` +
+        `(#${lastIteration.iterationNumber}) without tool calls (final text response)`,
+      );
+      
+      lastIteration.endTime = Date.now();
+      lastIteration.assistantMessage = finalAssistantMessage;
+      lastIteration.toolCalls = []; // No tool calls in final response
+      
+      // Extract usage from final assistant message
+      if (finalAssistantMessage) {
+        const usage = (finalAssistantMessage as { usage?: unknown }).usage;
+        if (usage && typeof usage === "object") {
+          const usageRecord = usage as Record<string, unknown>;
+          lastIteration.usage = {
+            input: typeof usageRecord.input_tokens === "number" ? usageRecord.input_tokens : undefined,
+            output: typeof usageRecord.output_tokens === "number" ? usageRecord.output_tokens : undefined,
+            cacheRead: typeof usageRecord.cache_read_input_tokens === "number" 
+              ? usageRecord.cache_read_input_tokens 
+              : undefined,
+            cacheWrite: typeof usageRecord.cache_creation_input_tokens === "number" 
+              ? usageRecord.cache_creation_input_tokens 
+              : undefined,
+            total: typeof usageRecord.total_tokens === "number" ? usageRecord.total_tokens : undefined,
+          };
+        }
+      }
+      
+      debug(
+        `[langfuse-tracer] [DEBUG] Completed final iteration ${lastIteration.iterationId}, ` +
+        `duration=${lastIteration.endTime - lastIteration.startTime}ms, toolCalls=0 (final)`,
+      );
     }
 
         // Build the batch: Trace + Generations + Iterations + Compactions + Spans (nested structure)
