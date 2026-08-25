@@ -17,6 +17,7 @@ A comprehensive tracing plugin for [OpenClaw](https://github.com/OpenClaw/opencl
 - 🔥 **Per-Iteration Tracking** - NEW! Monitor each LLM decision cycle separately with `agent_iteration_start`/`agent_iteration_end` hooks
 - 🔄 **Compaction Visibility** - NEW! Track context compression events with `before_compaction`/`after_compaction` hooks
 - 🏷️ **Tagged Inputs** - NEW! Clear section markers for system prompts, history, tool results, and outputs
+- 🔑 **Multi-Project Credentials** - NEW! Route different agents (or agent groups) to different Langfuse projects via `credentials[].agentIds`, instead of one shared project for the whole plugin
 
 ### Production Ready
 
@@ -110,14 +111,15 @@ openclaw config set plugins.entries.langfuse-tracer.hooks.allowConversationAcces
 4. **Configure via openclaw.json**
 
 ```bash
-# Set your Langfuse credentials
-openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
-openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
-openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
+# Set your Langfuse credentials (one project, applied to every agent)
+openclaw config set plugins.entries.langfuse-tracer.config.credentials \
+  '[{"publicKey":"pk-lf-xxx","secretKey":"sk-lf-xxx","baseUrl":"http://langfuse-web:3000"}]'
 
 # Restart gateway
 openclaw gateway restart
 ```
+
+Need different agents (or teams) to land in different Langfuse projects instead? See [Multi-Project Credentials](#multi-project-credentials-per-agent-routing) below.
 
 5. **Verify installation**
 
@@ -168,11 +170,13 @@ All configuration is managed via `~/.openclaw/openclaw.json`:
         },
         "config": {
           "logLevel": "info",
-          "langfuse": {
-            "publicKey": "pk-lf-xxx",
-            "secretKey": "sk-lf-xxx",
-            "baseUrl": "http://langfuse-web:3000"
-          },
+          "credentials": [
+            {
+              "publicKey": "pk-lf-xxx",
+              "secretKey": "sk-lf-xxx",
+              "baseUrl": "http://langfuse-web:3000"
+            }
+          ],
           "trackedAgents": [],
           "limits": {
             "userInput": 2000,
@@ -196,9 +200,8 @@ All configuration is managed via `~/.openclaw/openclaw.json`:
 openclaw config set plugins.entries.langfuse-tracer.hooks.allowConversationAccess true
 
 # STEP 2: Set Langfuse credentials
-openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
-openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
-openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse-web:3000"
+openclaw config set plugins.entries.langfuse-tracer.config.credentials \
+  '[{"publicKey":"pk-lf-xxx","secretKey":"sk-lf-xxx","baseUrl":"http://langfuse-web:3000"}]'
 
 # STEP 3: Optional - Enable debug logging
 openclaw config set plugins.entries.langfuse-tracer.config.logLevel "debug"
@@ -214,20 +217,44 @@ openclaw config set plugins.entries.langfuse-tracer.config.limits.assistantOutpu
 openclaw gateway restart
 ```
 
+### Multi-Project Credentials (per-agent routing)
+
+`credentials` is a **list** of Langfuse projects. Each entry can be scoped to specific agents via `agentIds`; an entry with no `agentIds` (or an empty list) is the **default/catch-all** group used for any agent not matched by a more specific entry. This lets different agents/teams send traces to different Langfuse projects from the same plugin instance, instead of every agent sharing one project.
+
+```bash
+openclaw config set plugins.entries.langfuse-tracer.config.credentials '[
+  {"publicKey":"pk-lf-teamA","secretKey":"sk-lf-teamA","agentIds":["teamA-agent"]},
+  {"publicKey":"pk-lf-teamB","secretKey":"sk-lf-teamB","agentIds":["teamB-agent"]},
+  {"publicKey":"pk-lf-default","secretKey":"sk-lf-default"}
+]'
+openclaw gateway restart
+```
+
+Resolution order for a given agent's trace, at `before_agent_start`:
+
+1. The first `credentials[]` entry whose `agentIds` includes that agent's ID.
+2. Otherwise, the first entry with no `agentIds` (or an empty list) — the default/catch-all group.
+3. Otherwise, the trace is skipped entirely (no group matched, nothing sent to Langfuse).
+
+**Backward compatibility**: the older single-project shorthand, `config.langfuse.{publicKey,secretKey,baseUrl}`, still works. If `credentials` doesn't already define a catch-all entry, `langfuse` (if set) is folded in as one. You only need `credentials` for new, multi-project setups — a single-project config can keep using either form.
+
 ### Configuration Reference
 
 #### Required Settings
 
-| Config Key           | Description                 | Example     |
-| -------------------- | --------------------------- | ----------- |
-| `langfuse.publicKey` | Langfuse project public key | `pk-lf-xxx` |
-| `langfuse.secretKey` | Langfuse project secret key | `sk-lf-xxx` |
+| Config Key                | Description                                                                        | Example                          |
+| -------------------------- | ----------------------------------------------------------------------------------- | --------------------------------- |
+| `credentials`              | Array of Langfuse credential groups (see [Multi-Project Credentials](#multi-project-credentials-per-agent-routing)); at least one group (or the deprecated `langfuse` object) must be configured | see example above |
+| `credentials[].publicKey`  | Langfuse project public key for this group                                          | `pk-lf-xxx`                       |
+| `credentials[].secretKey`  | Langfuse project secret key for this group                                          | `sk-lf-xxx`                       |
 
 #### Optional Settings
 
-| Config Key               | Description                               | Default                  |
-| ------------------------ | ----------------------------------------- | ------------------------ |
-| `langfuse.baseUrl`       | Langfuse server URL                       | `http://172.21.0.1:3050` |
+| Config Key                | Description                                                          | Default                  |
+| -------------------------- | ---------------------------------------------------------------------- | ------------------------ |
+| `credentials[].baseUrl`    | Langfuse server URL for this group                                     | `http://172.21.0.1:3050` |
+| `credentials[].agentIds`   | Agent IDs this group applies to; omit/empty = default/catch-all group  | _(none — catch-all)_     |
+| `langfuse.*`               | Deprecated single-project shorthand; same shape as one `credentials[]` entry, minus `agentIds`. Folded in as the catch-all group only if `credentials` defines none | _(unset)_ |
 | `logLevel`               | Log level: `info` or `debug`              | `info`                   |
 | `trackedAgents`          | Array of agent IDs to trace (empty = all) | `[]`                     |
 | `limits.userInput`       | Max chars for user input                  | `2000`                   |
@@ -589,14 +616,61 @@ openclaw gateway restart
 ```
 langfuse-tracer/
 ├── README.md              # This file
-├── package.json           # Plugin metadata
+├── package.json           # Plugin metadata (main/exports point at dist/)
+├── tsconfig.json           # Build config (tsc)
 ├── openclaw.plugin.json   # Plugin config schema
-├── index.ts               # Plugin entry point
-├── api.ts                 # Type exports
+├── index.ts               # Plugin entry point (source)
+├── api.ts                 # Type exports (source)
 ├── src/
-│   └── tracer.ts          # Core implementation
+│   └── tracer.ts          # Core implementation (source)
+├── dist/                  # Compiled output — this is what OpenClaw actually loads
 ├── HOOK.md                # Technical documentation
 ```
+
+## 🔧 Building From Source
+
+**OpenClaw never executes the TypeScript source directly.** `package.json`'s `main`/`exports` point at `./dist/index.js`, and `plugins.load.paths`/`openclaw plugins install` resolve the plugin through those fields — so only compiled output in `dist/` is ever loaded, not `index.ts`/`api.ts`/`src/tracer.ts`.
+
+`dist/` is committed to this repo, so a fresh clone or `openclaw plugins install` works immediately without building anything. You only need to build when you **edit the source** (`index.ts`, `api.ts`, or anything under `src/`) — until you rebuild, OpenClaw keeps running whatever `dist/` already contains, silently ignoring your source edit.
+
+```bash
+cd langfuse-tracer
+
+# Install the one build-time dependency (TypeScript itself; the plugin has
+# zero *runtime* dependencies — see Features above)
+npm install
+
+# Compile index.ts / api.ts / src/*.ts → dist/
+npm run build
+
+# Remove dist/ entirely, if you want a clean rebuild
+npm run clean
+```
+
+After building, restart (or reinstall) so OpenClaw picks up the new `dist/`:
+
+```bash
+openclaw gateway restart
+# or, if installed with `-l` (symlinked): openclaw plugins install . -l
+```
+
+If you're committing a source change, commit the regenerated `dist/*` files in the same change — otherwise anyone else's checkout (or your running deployment) keeps executing the old compiled code even though `src/` has moved on.
+
+### Expected build warnings (safe to ignore)
+
+Building this plugin **outside** a real OpenClaw installation — i.e. running `tsc` in this folder standalone, without the `openclaw` package available for type resolution — always prints something like:
+
+```
+api.ts:1:63 - error TS2307: Cannot find module 'openclaw/plugin-sdk/plugin-entry' or its corresponding type declarations.
+index.ts:1:35 - error TS2307: Cannot find module 'openclaw/plugin-sdk/plugin-entry' or its corresponding type declarations.
+index.ts:8:12 - error TS7006: Parameter 'api' implicitly has an 'any' type.
+src/tracer.ts:346:35 - error TS7006: Parameter 'event' implicitly has an 'any' type.
+... (one more TS7006 pair per api.on(...) handler)
+```
+
+This is expected and has been present since the initial release — `index.ts`/`api.ts` import a subpath (`openclaw/plugin-sdk/plugin-entry`) that only resolves inside a real OpenClaw checkout/install, not in this submodule's own isolated `npm install`. Once that one import can't be resolved, `api`'s type collapses to `any`, and every `api.on(...)` handler cascades into TS7006 from there — it's one root cause, not several independent bugs.
+
+`tsc` still exits non-zero (`npm run build` will report failure to any script checking its exit code), **but it still emits working JS into `dist/`** — `tsconfig.json` sets `"noEmitOnError": false` specifically so this doesn't block the build. Verify by diffing `dist/` after building; if your source edit shows up there, the build did what it needed to.
 
 ## 🤝 Contributing
 
@@ -614,11 +688,16 @@ Contributions are welcome! Please:
 # Clone the repo
 git clone https://github.com/syao-dai/openclaw_langfuse_tracer.git
 cd openclaw_langfuse_tracer
+npm install
 
 # Install in development mode
 openclaw plugins install .
 
 # Make changes to src/tracer.ts
+
+# Rebuild — see "Building From Source" above; skipping this step means
+# your change has no effect, since OpenClaw only ever loads dist/
+npm run build
 
 # Reload
 openclaw gateway restart

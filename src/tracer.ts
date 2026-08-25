@@ -11,33 +11,55 @@ import type { OpenClawPluginApi } from "../api.js";
  * Uses the Langfuse REST API directly (no npm packages required).
  *
  * Configuration via openclaw.json:
- *   langfuse.publicKey      — Langfuse project public key (required)
- *   langfuse.secretKey      — Langfuse project secret key (required)
- *   langfuse.baseUrl        — Langfuse server URL (default: http://172.21.0.1:3050)
- *   
+ *   credentials               — Array of Langfuse credential groups, each:
+ *     credentials[].publicKey   — Langfuse project public key (required)
+ *     credentials[].secretKey   — Langfuse project secret key (required)
+ *     credentials[].baseUrl     — Langfuse server URL (default: http://172.21.0.1:3050)
+ *     credentials[].agentIds    — Agent IDs this group applies to (omit/empty = default/catch-all)
+ *   langfuse                  — Deprecated single-project shorthand; folded in as the
+ *                                catch-all group if `credentials` has none. Same shape
+ *                                as one `credentials[]` entry, minus `agentIds`.
+ *
  *   limits.userInput        — Max chars for user input (default: 2000)
  *   limits.assistantOutput  — Max chars for assistant output (default: 10000)
  *   limits.systemPrompt     — Max chars for system prompt (default: 20000)
  *   limits.history          — Max chars for conversation history JSON (default: 5000)
  *   limits.toolParams       — Max chars for tool parameters (default: 500)
  *   limits.toolResult       — Max chars for tool result (default: 1000)
- *   
+ *
  *   trackedAgents           — Array of agent IDs to trace (default: [] = all agents)
  *
- * Example configuration:
- *   openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey "pk-lf-xxx"
- *   openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey "sk-lf-xxx"
- *   openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl "http://langfuse:3000"
+ * Example configuration — two teams, each with their own Langfuse project:
+ *   openclaw config set plugins.entries.langfuse-tracer.config.credentials '[
+ *     {"publicKey":"pk-lf-teamA","secretKey":"sk-lf-teamA","agentIds":["teamA-agent"]},
+ *     {"publicKey":"pk-lf-teamB","secretKey":"sk-lf-teamB","agentIds":["teamB-agent"]}
+ *   ]'
  */
+
+// One Langfuse project's credentials, optionally scoped to a set of agent IDs.
+// A group with no `agentIds` (or an empty list) is the catch-all/default group.
+interface CredentialGroup {
+  publicKey?: string;
+  secretKey?: string;
+  baseUrl?: string;
+  agentIds?: string[];
+}
+
+interface ResolvedCredentials {
+  baseUrl: string;
+  authHeader: string;
+}
 
 interface PluginConfig {
   trackedAgents?: string[];
   logLevel?: "info" | "debug";
+  /** @deprecated Use `credentials` (a list) instead. Still honored as the catch-all group when `credentials` doesn't provide one. */
   langfuse?: {
     publicKey?: string;
     secretKey?: string;
     baseUrl?: string;
   };
+  credentials?: CredentialGroup[];
   limits?: {
     userInput?: number;
     assistantOutput?: number;
@@ -58,6 +80,7 @@ interface AgentTrace {
   generations: GenerationRecord[];  // All LLM calls during this agent run
   iterations: IterationRecord[];  // All iterations during this agent run
   compactions: CompactionRecord[];  // All compactions during this agent run
+  credentials: ResolvedCredentials;  // Langfuse project this run's trace is sent to
 }
 
 // Represents one LLM generation (llm_input + llm_output pair)
@@ -203,27 +226,68 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     if (isDebug) api.logger.info(message);
   };
   
-  // Read credentials from plugin config only
-  const publicKey = pluginConfig.langfuse?.publicKey?.trim();
-  const secretKey = pluginConfig.langfuse?.secretKey?.trim();
-  const baseUrl = (
-    pluginConfig.langfuse?.baseUrl?.trim() 
-    ?? "http://172.21.0.1:3050"
-  ).replace(/\/$/, "");
+  // Read credentials from plugin config. `credentials` is a list of Langfuse
+  // projects, each optionally scoped to a set of agent IDs; the legacy
+  // `langfuse` object (if present) is folded in as the catch-all group so
+  // existing single-project configs keep working unchanged.
+  const defaultBaseUrl = "http://172.21.0.1:3050";
+  const isValidGroup = (
+    group: CredentialGroup | undefined,
+  ): group is CredentialGroup & { publicKey: string; secretKey: string } =>
+    Boolean(group?.publicKey?.trim() && group?.secretKey?.trim());
 
-  if (!publicKey || !secretKey) {
+  const credentialGroups: CredentialGroup[] = (
+    Array.isArray(pluginConfig.credentials) ? pluginConfig.credentials : []
+  ).filter(isValidGroup);
+
+  const hasExplicitCatchAll = credentialGroups.some(
+    (group) => !group.agentIds || group.agentIds.length === 0,
+  );
+  if (!hasExplicitCatchAll && isValidGroup(pluginConfig.langfuse)) {
+    credentialGroups.push(pluginConfig.langfuse);
+  }
+
+  if (credentialGroups.length === 0) {
     api.logger.info(
       "[langfuse-tracer] Langfuse credentials not configured. " +
-      "Configure via openclaw.json:\n" +
-      "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey 'pk-lf-xxx'\n" +
-      "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey 'sk-lf-xxx'\n" +
-      "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl 'http://langfuse:3000'\n" +
+      "Configure via openclaw.json, e.g.:\n" +
+      "  openclaw config set plugins.entries.langfuse-tracer.config.credentials " +
+      "'[{\"publicKey\":\"pk-lf-xxx\",\"secretKey\":\"sk-lf-xxx\",\"baseUrl\":\"http://langfuse:3000\"}]'\n" +
       "— tracing disabled",
     );
     return;
   }
 
-  const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
+  const authHeaderCache = new Map<string, string>();
+  const resolveCredentials = (agentId?: string): ResolvedCredentials | null => {
+    const group =
+      (agentId && credentialGroups.find((g) => g.agentIds?.includes(agentId))) ||
+      credentialGroups.find((g) => !g.agentIds || g.agentIds.length === 0);
+    if (!group) {
+      return null;
+    }
+    const key = `${group.publicKey}:${group.secretKey}`;
+    let authHeader = authHeaderCache.get(key);
+    if (!authHeader) {
+      authHeader = "Basic " + Buffer.from(key).toString("base64");
+      authHeaderCache.set(key, authHeader);
+    }
+    return {
+      baseUrl: (group.baseUrl?.trim() ?? defaultBaseUrl).replace(/\/$/, ""),
+      authHeader,
+    };
+  };
+
+  api.logger.info(
+    `[langfuse-tracer] Configured ${credentialGroups.length} Langfuse credential group(s): ` +
+    credentialGroups
+      .map((g, i) =>
+        g.agentIds && g.agentIds.length > 0
+          ? `#${i + 1}[agents: ${g.agentIds.join(", ")}]`
+          : `#${i + 1}[default/catch-all]`,
+      )
+      .join(", "),
+  );
 
   // Parse data limits from plugin config with defaults
   const dataLimits = {
@@ -256,7 +320,6 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     api.logger.info("[langfuse-tracer] Tracking all agents");
   }
 
-  api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
   if (isDebug) {
     api.logger.info(`[langfuse-tracer] Debug mode enabled`);
   }
@@ -292,10 +355,19 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       debug(`[langfuse-tracer] [DEBUG] Skipping agent ${eventCtx.agentId} (not in trackedAgents)`);
       return;
     }
-    
+
+    const credentials = resolveCredentials(eventCtx.agentId);
+    if (!credentials) {
+      debug(
+        `[langfuse-tracer] [DEBUG] No Langfuse credential group matches agent ` +
+        `${eventCtx.agentId} (and no default/catch-all group configured), skipping trace`,
+      );
+      return;
+    }
+
     const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
     const traceId = randomId();
-    
+
     // Create a new trace for this agent run
     const trace: AgentTrace = {
       traceId,
@@ -306,6 +378,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       generations: [],
       iterations: [],
       compactions: [],
+      credentials,
     };
     
     activeTraces.set(key, trace);
@@ -1036,10 +1109,10 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     );
 
     try {
-      const res = await fetch(`${baseUrl}/api/public/ingestion`, {
+      const res = await fetch(`${trace.credentials.baseUrl}/api/public/ingestion`, {
         method: "POST",
         headers: {
-          Authorization: authHeader,
+          Authorization: trace.credentials.authHeader,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ batch }),

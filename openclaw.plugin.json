@@ -12,7 +12,7 @@
       },
       "langfuse": {
         "type": "object",
-        "description": "Langfuse connection settings",
+        "description": "Deprecated: single-project shorthand. Use 'credentials' for new configs. Folded in as the catch-all group only if 'credentials' defines no default/catch-all entry.",
         "properties": {
           "publicKey": {
             "type": "string",
@@ -29,6 +29,36 @@
           }
         },
         "required": ["publicKey", "secretKey"]
+      },
+      "credentials": {
+        "type": "array",
+        "description": "Langfuse credential groups. Each entry is one Langfuse project, optionally scoped to a set of agent IDs. Entries with no 'agentIds' (or an empty list) act as the default/catch-all group for any agent not matched by a more specific entry.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "publicKey": {
+              "type": "string",
+              "description": "Langfuse project public key"
+            },
+            "secretKey": {
+              "type": "string",
+              "description": "Langfuse project secret key"
+            },
+            "baseUrl": {
+              "type": "string",
+              "description": "Langfuse server URL",
+              "default": "http://172.21.0.1:3050"
+            },
+            "agentIds": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Agent IDs this credential group applies to. Omit or leave empty to make this the default/catch-all group."
+            }
+          },
+          "required": ["publicKey", "secretKey"]
+        },
+        "default": []
       },
       "trackedAgents": {
         "type": "array",
@@ -80,8 +110,8 @@
       "help": "Set to 'debug' to see detailed event logs for troubleshooting"
     },
     "langfuse": {
-      "label": "Langfuse Configuration",
-      "help": "Configure connection to your self-hosted Langfuse instance"
+      "label": "Langfuse Configuration (deprecated)",
+      "help": "Single-project shorthand, kept for backward compatibility. Prefer 'credentials' for new configs."
     },
     "langfuse.publicKey": {
       "label": "Public Key",
@@ -95,6 +125,10 @@
     "langfuse.baseUrl": {
       "label": "Base URL",
       "help": "URL of your Langfuse server (e.g., http://langfuse-web:3000)"
+    },
+    "credentials": {
+      "label": "Langfuse Credential Groups",
+      "help": "One entry per Langfuse project. Scope an entry to specific agents via 'agentIds', or leave it unscoped to act as the default for any other agent."
     },
     "trackedAgents": {
       "label": "Tracked Agents",

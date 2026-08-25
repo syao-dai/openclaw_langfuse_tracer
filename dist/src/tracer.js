@@ -43,21 +43,49 @@ export function setupLangfuseTracer(api) {
         if (isDebug)
             api.logger.info(message);
     };
-    // Read credentials from plugin config only
-    const publicKey = pluginConfig.langfuse?.publicKey?.trim();
-    const secretKey = pluginConfig.langfuse?.secretKey?.trim();
-    const baseUrl = (pluginConfig.langfuse?.baseUrl?.trim()
-        ?? "http://172.21.0.1:3050").replace(/\/$/, "");
-    if (!publicKey || !secretKey) {
+    // Read credentials from plugin config. `credentials` is a list of Langfuse
+    // projects, each optionally scoped to a set of agent IDs; the legacy
+    // `langfuse` object (if present) is folded in as the catch-all group so
+    // existing single-project configs keep working unchanged.
+    const defaultBaseUrl = "http://172.21.0.1:3050";
+    const isValidGroup = (group) => Boolean(group?.publicKey?.trim() && group?.secretKey?.trim());
+    const credentialGroups = (Array.isArray(pluginConfig.credentials) ? pluginConfig.credentials : []).filter(isValidGroup);
+    const hasExplicitCatchAll = credentialGroups.some((group) => !group.agentIds || group.agentIds.length === 0);
+    if (!hasExplicitCatchAll && isValidGroup(pluginConfig.langfuse)) {
+        credentialGroups.push(pluginConfig.langfuse);
+    }
+    if (credentialGroups.length === 0) {
         api.logger.info("[langfuse-tracer] Langfuse credentials not configured. " +
-            "Configure via openclaw.json:\n" +
-            "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.publicKey 'pk-lf-xxx'\n" +
-            "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.secretKey 'sk-lf-xxx'\n" +
-            "  openclaw config set plugins.entries.langfuse-tracer.config.langfuse.baseUrl 'http://langfuse:3000'\n" +
+            "Configure via openclaw.json, e.g.:\n" +
+            "  openclaw config set plugins.entries.langfuse-tracer.config.credentials " +
+            "'[{\"publicKey\":\"pk-lf-xxx\",\"secretKey\":\"sk-lf-xxx\",\"baseUrl\":\"http://langfuse:3000\"}]'\n" +
             "— tracing disabled");
         return;
     }
-    const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
+    const authHeaderCache = new Map();
+    const resolveCredentials = (agentId) => {
+        const group = (agentId && credentialGroups.find((g) => g.agentIds?.includes(agentId))) ||
+            credentialGroups.find((g) => !g.agentIds || g.agentIds.length === 0);
+        if (!group) {
+            return null;
+        }
+        const key = `${group.publicKey}:${group.secretKey}`;
+        let authHeader = authHeaderCache.get(key);
+        if (!authHeader) {
+            authHeader = "Basic " + Buffer.from(key).toString("base64");
+            authHeaderCache.set(key, authHeader);
+        }
+        return {
+            baseUrl: (group.baseUrl?.trim() ?? defaultBaseUrl).replace(/\/$/, ""),
+            authHeader,
+        };
+    };
+    api.logger.info(`[langfuse-tracer] Configured ${credentialGroups.length} Langfuse credential group(s): ` +
+        credentialGroups
+            .map((g, i) => g.agentIds && g.agentIds.length > 0
+            ? `#${i + 1}[agents: ${g.agentIds.join(", ")}]`
+            : `#${i + 1}[default/catch-all]`)
+            .join(", "));
     // Parse data limits from plugin config with defaults
     const dataLimits = {
         userInput: pluginConfig.limits?.userInput ?? 2000,
@@ -83,7 +111,6 @@ export function setupLangfuseTracer(api) {
     else {
         api.logger.info("[langfuse-tracer] Tracking all agents");
     }
-    api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
     if (isDebug) {
         api.logger.info(`[langfuse-tracer] Debug mode enabled`);
     }
@@ -106,6 +133,12 @@ export function setupLangfuseTracer(api) {
             debug(`[langfuse-tracer] [DEBUG] Skipping agent ${eventCtx.agentId} (not in trackedAgents)`);
             return;
         }
+        const credentials = resolveCredentials(eventCtx.agentId);
+        if (!credentials) {
+            debug(`[langfuse-tracer] [DEBUG] No Langfuse credential group matches agent ` +
+                `${eventCtx.agentId} (and no default/catch-all group configured), skipping trace`);
+            return;
+        }
         const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
         const traceId = randomId();
         // Create a new trace for this agent run
@@ -118,6 +151,7 @@ export function setupLangfuseTracer(api) {
             generations: [],
             iterations: [],
             compactions: [],
+            credentials,
         };
         activeTraces.set(key, trace);
         debug(`[langfuse-tracer] [DEBUG] Created trace ${traceId} for ${key}`);
@@ -707,10 +741,10 @@ export function setupLangfuseTracer(api) {
             `${totalCompactions} compactions, ${totalSpans} spans, ` +
             `${batch.length} total items`);
         try {
-            const res = await fetch(`${baseUrl}/api/public/ingestion`, {
+            const res = await fetch(`${trace.credentials.baseUrl}/api/public/ingestion`, {
                 method: "POST",
                 headers: {
-                    Authorization: authHeader,
+                    Authorization: trace.credentials.authHeader,
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({ batch }),
