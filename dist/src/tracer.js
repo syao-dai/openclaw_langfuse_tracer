@@ -14,6 +14,57 @@ function extractText(content, maxLen) {
 function randomId() {
     return crypto.randomUUID();
 }
+// JSON.stringify(undefined) returns the JS value `undefined`, not a string — calling
+// .slice() on that throws. Tool calls that never received an after_tool_call (because
+// the run was aborted/killed mid-call) leave span.input/output as `undefined`, so every
+// call site that serializes them needs this instead of a bare JSON.stringify(...).slice(...).
+function safeStringifySlice(value, maxLen, fallback = "null") {
+    let str;
+    try {
+        str = JSON.stringify(value) ?? fallback;
+    }
+    catch {
+        str = fallback;
+    }
+    return str.slice(0, maxLen);
+}
+// Builds the span-create batch item for one tool call. Shared by generation-level and
+// iteration-level spans. A span with no endTime never received after_tool_call — the run
+// was aborted/killed while the tool was in flight — so it's flagged rather than dropped,
+// since a killed trace is still valuable for debugging.
+function buildSpanBatchItem(span, parentObservationId, traceId, now, dataLimits) {
+    const killed = !span.endTime;
+    const spanStartTime = new Date(span.startTime).toISOString();
+    const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+    let output;
+    if (span.error) {
+        output = `ERROR: ${span.error}`;
+    }
+    else if (killed) {
+        output = "[killed] run was aborted/terminated before this tool call completed";
+    }
+    else {
+        output = safeStringifySlice(span.output, dataLimits.toolResult);
+    }
+    return {
+        id: randomId(),
+        type: "span-create",
+        timestamp: now,
+        body: {
+            id: span.spanId,
+            traceId,
+            parentObservationId,
+            name: span.toolName,
+            startTime: spanStartTime,
+            endTime: spanEndTime,
+            input: safeStringifySlice(span.input, dataLimits.toolParams),
+            output,
+            level: span.error ? "ERROR" : killed ? "WARNING" : "DEFAULT",
+            statusMessage: span.error ?? (killed ? "killed: run aborted before tool call completed" : undefined),
+            metadata: killed ? { ...span.metadata, killed: true } : span.metadata,
+        },
+    };
+}
 /**
  * OpenClaw can re-invoke a plugin's setup() mid-session (e.g. when a subagent
  * spawn forces a plugin registry reload) without the process restarting. A
@@ -468,270 +519,262 @@ export function setupLangfuseTracer(api) {
                 `duration=${lastIteration.endTime - lastIteration.startTime}ms, toolCalls=0 (final)`);
         }
         // Build the batch: Trace + Generations + Iterations + Compactions + Spans (nested structure)
-        const batch = [];
+        let batch = [];
         // Count total spans, generations, iterations, and compactions for summary
         let totalSpans = 0;
-        let totalGenerations = trace.generations.length;
-        let totalIterations = trace.iterations.length;
-        let totalCompactions = trace.compactions.length;
+        const totalGenerations = trace.generations.length;
+        const totalIterations = trace.iterations.length;
+        const totalCompactions = trace.compactions.length;
         trace.generations.forEach(gen => { totalSpans += gen.spans.length; });
         trace.iterations.forEach(iter => { totalSpans += iter.spans.length; });
-        // Collect all providers and models
-        const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
-        const models = new Set(trace.generations.map(g => g.model).filter(Boolean));
-        // 1. Create the Trace
-        batch.push({
-            id: randomId(),
-            type: "trace-create",
-            timestamp: now,
-            body: {
-                id: trace.traceId,
-                name: "openclaw-agent-run",
-                sessionId: sessionKey ?? undefined,
-                userId: agentId ?? "unknown",
-                tags: [
-                    "openclaw",
-                    agentId ?? "unknown",
-                    ...Array.from(providers),
-                    ...Array.from(models),
-                ],
-                input: trace.userInput.slice(0, dataLimits.userInput) || undefined,
-                output: finalOutput || undefined,
-                metadata: {
-                    success,
-                    error: error ?? undefined,
-                    messageCount: messages.length,
-                    totalGenerations,
-                    totalIterations,
-                    totalCompactions,
-                    totalToolCalls: totalSpans,
-                    agentDurationMs: durationMs,
-                },
-                timestamp: startTime,
-            },
-        });
-        // 2. Create each Generation observation
-        trace.generations.forEach((gen) => {
-            const genStartTime = new Date(gen.startTime).toISOString();
-            const genEndTime = gen.endTime ? new Date(gen.endTime).toISOString() : now;
+        try {
+            // Collect all providers and models
+            const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
+            const models = new Set(trace.generations.map(g => g.model).filter(Boolean));
+            // 1. Create the Trace
             batch.push({
                 id: randomId(),
-                type: "generation-create",
+                type: "trace-create",
                 timestamp: now,
                 body: {
-                    id: gen.generationId,
-                    traceId: trace.traceId,
-                    name: `llm-call-${gen.model ?? "unknown"}`,
-                    model: gen.model,
-                    startTime: genStartTime,
-                    endTime: genEndTime,
-                    input: gen.input || undefined,
-                    output: gen.output || undefined,
-                    usage: gen.usage ? {
-                        input: gen.usage.input,
-                        output: gen.usage.output,
-                        unit: "TOKENS",
-                    } : undefined,
+                    id: trace.traceId,
+                    name: "openclaw-agent-run",
+                    sessionId: sessionKey ?? undefined,
+                    userId: agentId ?? "unknown",
+                    tags: [
+                        "openclaw",
+                        agentId ?? "unknown",
+                        ...Array.from(providers),
+                        ...Array.from(models),
+                    ],
+                    input: trace.userInput.slice(0, dataLimits.userInput) || undefined,
+                    output: finalOutput || undefined,
                     metadata: {
-                        provider: gen.provider,
-                        runId: gen.runId,
-                        toolCallsCount: gen.spans.length,
-                        cacheRead: gen.usage?.cacheRead,
-                        cacheWrite: gen.usage?.cacheWrite,
+                        success,
+                        error: error ?? undefined,
+                        messageCount: messages.length,
+                        totalGenerations,
+                        totalIterations,
+                        totalCompactions,
+                        totalToolCalls: totalSpans,
+                        agentDurationMs: durationMs,
                     },
+                    timestamp: startTime,
                 },
             });
-            // 3. Create each Span (tool call) under this generation
-            gen.spans.forEach((span) => {
-                const spanStartTime = new Date(span.startTime).toISOString();
-                const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+            // 2. Create each Generation observation
+            trace.generations.forEach((gen) => {
+                const genStartTime = new Date(gen.startTime).toISOString();
+                const genEndTime = gen.endTime ? new Date(gen.endTime).toISOString() : now;
+                batch.push({
+                    id: randomId(),
+                    type: "generation-create",
+                    timestamp: now,
+                    body: {
+                        id: gen.generationId,
+                        traceId: trace.traceId,
+                        name: `llm-call-${gen.model ?? "unknown"}`,
+                        model: gen.model,
+                        startTime: genStartTime,
+                        endTime: genEndTime,
+                        input: gen.input || undefined,
+                        output: gen.output || undefined,
+                        usage: gen.usage ? {
+                            input: gen.usage.input,
+                            output: gen.usage.output,
+                            unit: "TOKENS",
+                        } : undefined,
+                        metadata: {
+                            provider: gen.provider,
+                            runId: gen.runId,
+                            toolCallsCount: gen.spans.length,
+                            cacheRead: gen.usage?.cacheRead,
+                            cacheWrite: gen.usage?.cacheWrite,
+                        },
+                    },
+                });
+                // 3. Create each Span (tool call) under this generation
+                gen.spans.forEach((span) => {
+                    batch.push(buildSpanBatchItem(span, gen.generationId, trace.traceId, now, dataLimits));
+                });
+            });
+            // 3. Create each Iteration observation (agent_iteration_start → agent_iteration_end)
+            trace.iterations.forEach((iter) => {
+                const iterStartTime = new Date(iter.startTime).toISOString();
+                const iterEndTime = iter.endTime ? new Date(iter.endTime).toISOString() : now;
+                // 🏷️ Build structured JSON input for Langfuse parsing
+                const inputData = {};
+                // TOOL_RESULTS as JSON key
+                if (iter.toolResults && iter.toolResults.length > 0) {
+                    inputData.TOOL_RESULTS = {
+                        count: iter.toolResults.length,
+                        results: iter.toolResults,
+                    };
+                }
+                // RECENT_HISTORY as JSON key
+                if (iter.recentMessages && iter.recentMessages.length > 0) {
+                    inputData.RECENT_HISTORY = {
+                        count: iter.recentMessages.length,
+                        messages: iter.recentMessages,
+                    };
+                }
+                // Convert input to JSON string
+                let inputStr;
+                try {
+                    inputStr = Object.keys(inputData).length > 0
+                        ? JSON.stringify(inputData, null, 2)
+                        : undefined;
+                }
+                catch (err) {
+                    inputStr = JSON.stringify({ error: "Failed to serialize input" });
+                }
+                // 🏷️ Build structured JSON output for Langfuse parsing
+                const outputData = {};
+                // ASSISTANT_OUTPUT as JSON key
+                if (iter.assistantMessage) {
+                    outputData.ASSISTANT_OUTPUT = iter.assistantMessage;
+                }
+                // TOOL_CALLS_PLANNED as JSON key
+                if (iter.toolCalls && iter.toolCalls.length > 0) {
+                    outputData.TOOL_CALLS_PLANNED = iter.toolCalls;
+                }
+                // Convert output to JSON string
+                let outputStr;
+                try {
+                    outputStr = Object.keys(outputData).length > 0
+                        ? JSON.stringify(outputData, null, 2)
+                        : undefined;
+                }
+                catch (err) {
+                    outputStr = JSON.stringify({ error: "Failed to serialize output" });
+                }
+                batch.push({
+                    id: randomId(),
+                    type: "generation-create",
+                    timestamp: now,
+                    body: {
+                        id: iter.iterationId,
+                        traceId: trace.traceId,
+                        name: `iteration-${iter.iterationNumber}`,
+                        startTime: iterStartTime,
+                        endTime: iterEndTime,
+                        input: inputStr,
+                        output: outputStr,
+                        usage: iter.usage ? {
+                            input: iter.usage.input,
+                            output: iter.usage.output,
+                            unit: "TOKENS",
+                        } : undefined,
+                        metadata: {
+                            iterationType: "llm-iteration",
+                            iterationNumber: iter.iterationNumber,
+                            runId: iter.runId,
+                            toolCallsPlanned: iter.toolCalls?.length ?? 0,
+                            cacheRead: iter.usage?.cacheRead,
+                            cacheWrite: iter.usage?.cacheWrite,
+                        },
+                    },
+                });
+                // Attach tool execution spans under this iteration
+                iter.spans.forEach((span) => {
+                    batch.push(buildSpanBatchItem(span, iter.iterationId, trace.traceId, now, dataLimits));
+                });
+            });
+            // 4. Create each Compaction observation
+            trace.compactions.forEach((comp) => {
+                const compStartTime = new Date(comp.startTime).toISOString();
+                const compEndTime = comp.endTime ? new Date(comp.endTime).toISOString() : now;
+                // 🏷️ Build structured JSON for compaction changes
+                const inputData = {};
+                // BEFORE_COMPACTION as JSON key
+                if (comp.messageCountBefore || comp.systemPromptBefore || comp.historyBefore) {
+                    inputData.BEFORE_COMPACTION = {
+                        messageCount: comp.messageCountBefore,
+                        systemPrompt: comp.systemPromptBefore?.slice(0, 1000),
+                        historyMessageCount: comp.historyBefore?.length,
+                    };
+                }
+                // AFTER_COMPACTION as JSON key
+                if (comp.messageCountAfter || comp.systemPromptAfter || comp.historyAfter) {
+                    inputData.AFTER_COMPACTION = {
+                        messageCount: comp.messageCountAfter,
+                        systemPrompt: comp.systemPromptAfter?.slice(0, 1000),
+                        historyMessageCount: comp.historyAfter?.length,
+                        note: "AGENTS.md sections re-injected",
+                    };
+                }
+                // Convert to JSON string
+                let inputStr;
+                try {
+                    inputStr = JSON.stringify(inputData, null, 2);
+                }
+                catch (err) {
+                    inputStr = JSON.stringify({ error: "Failed to serialize compaction data" });
+                }
+                // Build output summary
+                const outputData = {
+                    messageReduction: {
+                        before: comp.messageCountBefore ?? 0,
+                        after: comp.messageCountAfter ?? 0,
+                        reduced: (comp.messageCountBefore ?? 0) - (comp.messageCountAfter ?? 0),
+                    },
+                };
                 batch.push({
                     id: randomId(),
                     type: "span-create",
                     timestamp: now,
                     body: {
-                        id: span.spanId,
+                        id: comp.compactionId,
                         traceId: trace.traceId,
-                        parentObservationId: gen.generationId, // Nest under generation
-                        name: span.toolName,
-                        startTime: spanStartTime,
-                        endTime: spanEndTime,
-                        input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
-                        output: span.error
-                            ? `ERROR: ${span.error}`
-                            : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
-                        level: span.error ? "ERROR" : "DEFAULT",
-                        statusMessage: span.error ?? undefined,
-                        metadata: span.metadata,
+                        name: "compaction",
+                        startTime: compStartTime,
+                        endTime: compEndTime,
+                        input: inputStr,
+                        output: JSON.stringify(outputData, null, 2),
+                        metadata: {
+                            type: "context-compaction",
+                            messageCountBefore: comp.messageCountBefore,
+                            messageCountAfter: comp.messageCountAfter,
+                            reduction: comp.messageCountBefore && comp.messageCountAfter
+                                ? comp.messageCountBefore - comp.messageCountAfter
+                                : undefined,
+                        },
                     },
                 });
             });
-        });
-        // 3. Create each Iteration observation (agent_iteration_start → agent_iteration_end)
-        trace.iterations.forEach((iter) => {
-            const iterStartTime = new Date(iter.startTime).toISOString();
-            const iterEndTime = iter.endTime ? new Date(iter.endTime).toISOString() : now;
-            // 🏷️ Build structured JSON input for Langfuse parsing
-            const inputData = {};
-            // TOOL_RESULTS as JSON key
-            if (iter.toolResults && iter.toolResults.length > 0) {
-                inputData.TOOL_RESULTS = {
-                    count: iter.toolResults.length,
-                    results: iter.toolResults,
-                };
-            }
-            // RECENT_HISTORY as JSON key
-            if (iter.recentMessages && iter.recentMessages.length > 0) {
-                inputData.RECENT_HISTORY = {
-                    count: iter.recentMessages.length,
-                    messages: iter.recentMessages,
-                };
-            }
-            // Convert input to JSON string
-            let inputStr;
-            try {
-                inputStr = Object.keys(inputData).length > 0
-                    ? JSON.stringify(inputData, null, 2)
-                    : undefined;
-            }
-            catch (err) {
-                inputStr = JSON.stringify({ error: "Failed to serialize input" });
-            }
-            // 🏷️ Build structured JSON output for Langfuse parsing
-            const outputData = {};
-            // ASSISTANT_OUTPUT as JSON key
-            if (iter.assistantMessage) {
-                outputData.ASSISTANT_OUTPUT = iter.assistantMessage;
-            }
-            // TOOL_CALLS_PLANNED as JSON key
-            if (iter.toolCalls && iter.toolCalls.length > 0) {
-                outputData.TOOL_CALLS_PLANNED = iter.toolCalls;
-            }
-            // Convert output to JSON string
-            let outputStr;
-            try {
-                outputStr = Object.keys(outputData).length > 0
-                    ? JSON.stringify(outputData, null, 2)
-                    : undefined;
-            }
-            catch (err) {
-                outputStr = JSON.stringify({ error: "Failed to serialize output" });
-            }
-            batch.push({
-                id: randomId(),
-                type: "generation-create",
-                timestamp: now,
-                body: {
-                    id: iter.iterationId,
-                    traceId: trace.traceId,
-                    name: `iteration-${iter.iterationNumber}`,
-                    startTime: iterStartTime,
-                    endTime: iterEndTime,
-                    input: inputStr,
-                    output: outputStr,
-                    usage: iter.usage ? {
-                        input: iter.usage.input,
-                        output: iter.usage.output,
-                        unit: "TOKENS",
-                    } : undefined,
-                    metadata: {
-                        iterationType: "llm-iteration",
-                        iterationNumber: iter.iterationNumber,
-                        runId: iter.runId,
-                        toolCallsPlanned: iter.toolCalls?.length ?? 0,
-                        cacheRead: iter.usage?.cacheRead,
-                        cacheWrite: iter.usage?.cacheWrite,
-                    },
-                },
-            });
-            // Attach tool execution spans under this iteration
-            iter.spans.forEach((span) => {
-                const spanStartTime = new Date(span.startTime).toISOString();
-                const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
-                batch.push({
+        }
+        catch (err) {
+            // Even a malformed/killed trace is worth debugging in Langfuse — never drop it
+            // silently just because one generation/iteration/span failed to serialize.
+            api.logger.warn(`[langfuse-tracer] Failed to build full batch for trace ${trace.traceId}, ` +
+                `sending minimal trace record instead: ${String(err)}`);
+            batch = [{
                     id: randomId(),
-                    type: "span-create",
+                    type: "trace-create",
                     timestamp: now,
                     body: {
-                        id: span.spanId,
-                        traceId: trace.traceId,
-                        parentObservationId: iter.iterationId, // Nest under iteration
-                        name: span.toolName,
-                        startTime: spanStartTime,
-                        endTime: spanEndTime,
-                        input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
-                        output: span.error
-                            ? `ERROR: ${span.error}`
-                            : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
-                        level: span.error ? "ERROR" : "DEFAULT",
-                        statusMessage: span.error ?? undefined,
-                        metadata: span.metadata,
+                        id: trace.traceId,
+                        name: "openclaw-agent-run",
+                        sessionId: sessionKey ?? undefined,
+                        userId: agentId ?? "unknown",
+                        tags: ["openclaw", agentId ?? "unknown", "batch-build-error"],
+                        input: (trace.userInput || "").slice(0, dataLimits.userInput) || undefined,
+                        output: finalOutput || undefined,
+                        metadata: {
+                            success,
+                            error: error ?? undefined,
+                            batchBuildError: String(err),
+                            messageCount: messages.length,
+                            totalGenerations,
+                            totalIterations,
+                            totalCompactions,
+                            totalToolCalls: totalSpans,
+                            agentDurationMs: durationMs,
+                        },
+                        timestamp: startTime,
                     },
-                });
-            });
-        });
-        // 4. Create each Compaction observation
-        trace.compactions.forEach((comp) => {
-            const compStartTime = new Date(comp.startTime).toISOString();
-            const compEndTime = comp.endTime ? new Date(comp.endTime).toISOString() : now;
-            // 🏷️ Build structured JSON for compaction changes
-            const inputData = {};
-            // BEFORE_COMPACTION as JSON key
-            if (comp.messageCountBefore || comp.systemPromptBefore || comp.historyBefore) {
-                inputData.BEFORE_COMPACTION = {
-                    messageCount: comp.messageCountBefore,
-                    systemPrompt: comp.systemPromptBefore?.slice(0, 1000),
-                    historyMessageCount: comp.historyBefore?.length,
-                };
-            }
-            // AFTER_COMPACTION as JSON key
-            if (comp.messageCountAfter || comp.systemPromptAfter || comp.historyAfter) {
-                inputData.AFTER_COMPACTION = {
-                    messageCount: comp.messageCountAfter,
-                    systemPrompt: comp.systemPromptAfter?.slice(0, 1000),
-                    historyMessageCount: comp.historyAfter?.length,
-                    note: "AGENTS.md sections re-injected",
-                };
-            }
-            // Convert to JSON string
-            let inputStr;
-            try {
-                inputStr = JSON.stringify(inputData, null, 2);
-            }
-            catch (err) {
-                inputStr = JSON.stringify({ error: "Failed to serialize compaction data" });
-            }
-            // Build output summary
-            const outputData = {
-                messageReduction: {
-                    before: comp.messageCountBefore ?? 0,
-                    after: comp.messageCountAfter ?? 0,
-                    reduced: (comp.messageCountBefore ?? 0) - (comp.messageCountAfter ?? 0),
-                },
-            };
-            batch.push({
-                id: randomId(),
-                type: "span-create",
-                timestamp: now,
-                body: {
-                    id: comp.compactionId,
-                    traceId: trace.traceId,
-                    name: "compaction",
-                    startTime: compStartTime,
-                    endTime: compEndTime,
-                    input: inputStr,
-                    output: JSON.stringify(outputData, null, 2),
-                    metadata: {
-                        type: "context-compaction",
-                        messageCountBefore: comp.messageCountBefore,
-                        messageCountAfter: comp.messageCountAfter,
-                        reduction: comp.messageCountBefore && comp.messageCountAfter
-                            ? comp.messageCountBefore - comp.messageCountAfter
-                            : undefined,
-                    },
-                },
-            });
-        });
+                }];
+        }
         // Cleanup
         activeTraces.delete(key);
         trace.generations.forEach(gen => activeGenerations.delete(gen.runId));

@@ -195,6 +195,71 @@ function randomId(): string {
   return crypto.randomUUID();
 }
 
+// JSON.stringify(undefined) returns the JS value `undefined`, not a string — calling
+// .slice() on that throws. Tool calls that never received an after_tool_call (because
+// the run was aborted/killed mid-call) leave span.input/output as `undefined`, so every
+// call site that serializes them needs this instead of a bare JSON.stringify(...).slice(...).
+function safeStringifySlice(value: unknown, maxLen: number, fallback = "null"): string {
+  let str: string;
+  try {
+    str = JSON.stringify(value) ?? fallback;
+  } catch {
+    str = fallback;
+  }
+  return str.slice(0, maxLen);
+}
+
+// Builds the span-create batch item for one tool call. Shared by generation-level and
+// iteration-level spans. A span with no endTime never received after_tool_call — the run
+// was aborted/killed while the tool was in flight — so it's flagged rather than dropped,
+// since a killed trace is still valuable for debugging.
+function buildSpanBatchItem(
+  span: SpanRecord,
+  parentObservationId: string,
+  traceId: string,
+  now: string,
+  dataLimits: PluginConfig["limits"] & {
+    userInput: number;
+    assistantOutput: number;
+    systemPrompt: number;
+    history: number;
+    toolParams: number;
+    toolResult: number;
+  },
+): LangfuseBatchItem {
+  const killed = !span.endTime;
+  const spanStartTime = new Date(span.startTime).toISOString();
+  const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
+
+  let output: string;
+  if (span.error) {
+    output = `ERROR: ${span.error}`;
+  } else if (killed) {
+    output = "[killed] run was aborted/terminated before this tool call completed";
+  } else {
+    output = safeStringifySlice(span.output, dataLimits.toolResult);
+  }
+
+  return {
+    id: randomId(),
+    type: "span-create",
+    timestamp: now,
+    body: {
+      id: span.spanId,
+      traceId,
+      parentObservationId,
+      name: span.toolName,
+      startTime: spanStartTime,
+      endTime: spanEndTime,
+      input: safeStringifySlice(span.input, dataLimits.toolParams),
+      output,
+      level: span.error ? "ERROR" : killed ? "WARNING" : "DEFAULT",
+      statusMessage: span.error ?? (killed ? "killed: run aborted before tool call completed" : undefined),
+      metadata: killed ? { ...span.metadata, killed: true } : span.metadata,
+    },
+  };
+}
+
 /**
  * OpenClaw can re-invoke a plugin's setup() mid-session (e.g. when a subagent
  * spawn forces a plugin registry reload) without the process restarting. A
@@ -807,16 +872,17 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
     }
 
         // Build the batch: Trace + Generations + Iterations + Compactions + Spans (nested structure)
-    const batch: LangfuseBatchItem[] = [];
-    
+    let batch: LangfuseBatchItem[] = [];
+
     // Count total spans, generations, iterations, and compactions for summary
     let totalSpans = 0;
-    let totalGenerations = trace.generations.length;
-    let totalIterations = trace.iterations.length;
-    let totalCompactions = trace.compactions.length;
+    const totalGenerations = trace.generations.length;
+    const totalIterations = trace.iterations.length;
+    const totalCompactions = trace.compactions.length;
     trace.generations.forEach(gen => { totalSpans += gen.spans.length; });
     trace.iterations.forEach(iter => { totalSpans += iter.spans.length; });
-    
+
+    try {
     // Collect all providers and models
     const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
     const models = new Set(trace.generations.map(g => g.model).filter(Boolean));
@@ -888,30 +954,8 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       
       // 3. Create each Span (tool call) under this generation
       gen.spans.forEach((span) => {
-        const spanStartTime = new Date(span.startTime).toISOString();
-        const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
-        
-        batch.push({
-          id: randomId(),
-          type: "span-create",
-          timestamp: now,
-          body: {
-            id: span.spanId,
-            traceId: trace.traceId,
-            parentObservationId: gen.generationId,  // Nest under generation
-            name: span.toolName,
-            startTime: spanStartTime,
-            endTime: spanEndTime,
-            input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
-            output: span.error 
-              ? `ERROR: ${span.error}` 
-              : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
-            level: span.error ? "ERROR" : "DEFAULT",
-            statusMessage: span.error ?? undefined,
-            metadata: span.metadata,
-          },
-        });
-    });
+        batch.push(buildSpanBatchItem(span, gen.generationId, trace.traceId, now, dataLimits));
+      });
     });
     
         // 3. Create each Iteration observation (agent_iteration_start → agent_iteration_end)
@@ -1002,29 +1046,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       
       // Attach tool execution spans under this iteration
       iter.spans.forEach((span) => {
-        const spanStartTime = new Date(span.startTime).toISOString();
-        const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
-        
-        batch.push({
-          id: randomId(),
-          type: "span-create",
-          timestamp: now,
-          body: {
-            id: span.spanId,
-            traceId: trace.traceId,
-            parentObservationId: iter.iterationId,  // Nest under iteration
-            name: span.toolName,
-            startTime: spanStartTime,
-            endTime: spanEndTime,
-            input: JSON.stringify(span.input).slice(0, dataLimits.toolParams),
-            output: span.error 
-              ? `ERROR: ${span.error}` 
-              : JSON.stringify(span.output).slice(0, dataLimits.toolResult),
-            level: span.error ? "ERROR" : "DEFAULT",
-            statusMessage: span.error ?? undefined,
-            metadata: span.metadata,
-          },
-        });
+        batch.push(buildSpanBatchItem(span, iter.iterationId, trace.traceId, now, dataLimits));
       });
     });
     
@@ -1095,7 +1117,41 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
         },
       });
     });
-    
+    } catch (err) {
+      // Even a malformed/killed trace is worth debugging in Langfuse — never drop it
+      // silently just because one generation/iteration/span failed to serialize.
+      api.logger.warn(
+        `[langfuse-tracer] Failed to build full batch for trace ${trace.traceId}, ` +
+        `sending minimal trace record instead: ${String(err)}`,
+      );
+      batch = [{
+        id: randomId(),
+        type: "trace-create",
+        timestamp: now,
+        body: {
+          id: trace.traceId,
+          name: "openclaw-agent-run",
+          sessionId: sessionKey ?? undefined,
+          userId: agentId ?? "unknown",
+          tags: ["openclaw", agentId ?? "unknown", "batch-build-error"],
+          input: (trace.userInput || "").slice(0, dataLimits.userInput) || undefined,
+          output: finalOutput || undefined,
+          metadata: {
+            success,
+            error: error ?? undefined,
+            batchBuildError: String(err),
+            messageCount: messages.length,
+            totalGenerations,
+            totalIterations,
+            totalCompactions,
+            totalToolCalls: totalSpans,
+            agentDurationMs: durationMs,
+          },
+          timestamp: startTime,
+        },
+      }];
+    }
+
     // Cleanup
     activeTraces.delete(key);
     trace.generations.forEach(gen => activeGenerations.delete(gen.runId));
