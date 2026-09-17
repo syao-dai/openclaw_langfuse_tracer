@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 function extractText(content, maxLen) {
     if (typeof content === "string") {
         return content.slice(0, maxLen);
@@ -11,8 +12,104 @@ function extractText(content, maxLen) {
     }
     return "";
 }
-function randomId() {
-    return crypto.randomUUID();
+// OTel requires valid hex trace/span IDs (16 bytes / 8 bytes). These replace the
+// old crypto.randomUUID()-based ids everywhere an id doubles as an OTel
+// traceId/spanId (trace.traceId, generation/iteration/compaction/tool-span ids) —
+// no new dependency, node:crypto's randomBytes is a Node builtin.
+function newTraceId() {
+    return randomBytes(16).toString("hex");
+}
+function newSpanId() {
+    return randomBytes(8).toString("hex");
+}
+function attrStr(key, value) {
+    if (!value)
+        return undefined;
+    return { key, value: { stringValue: value } };
+}
+function attrInt(key, value) {
+    if (typeof value !== "number" || !Number.isFinite(value))
+        return undefined;
+    return { key, value: { intValue: String(Math.trunc(value)) } };
+}
+function attrBool(key, value) {
+    if (typeof value !== "boolean")
+        return undefined;
+    return { key, value: { boolValue: value } };
+}
+function attrStrArray(key, values) {
+    if (!values || values.length === 0)
+        return undefined;
+    return { key, value: { arrayValue: { values: values.map((v) => ({ stringValue: v })) } } };
+}
+function compactAttrs(attrs) {
+    return attrs.filter((a) => a !== undefined);
+}
+// Nanosecond-precision unix timestamp as a string, per OTLP/JSON spec (avoids JS
+// number precision loss for large nanosecond values). Inputs are the ms-epoch
+// numbers this plugin already stores (Date.now()).
+function toUnixNano(msEpoch) {
+    return (BigInt(Math.round(msEpoch)) * 1000000n).toString();
+}
+// Trace-level concepts (user/session/trace name/tags/custom metadata) have no
+// separate "trace" object anymore under OTLP — Langfuse v4 requires them to be
+// copied onto every span that needs to be queryable by them, so this is spread
+// into every span's attributes below rather than set once on a root object.
+function buildTraceLevelAttributes(params) {
+    const attrs = [
+        attrStr("langfuse.user.id", params.agentId),
+        attrStr("langfuse.session.id", params.sessionKey),
+        attrStr("langfuse.trace.name", params.traceName),
+        attrStrArray("langfuse.trace.tags", params.tags),
+    ];
+    for (const [k, v] of Object.entries(params.metadata)) {
+        if (v === undefined || v === null)
+            continue;
+        if (typeof v === "number") {
+            attrs.push(attrInt(`langfuse.trace.metadata.${k}`, v));
+        }
+        else if (typeof v === "boolean") {
+            attrs.push(attrBool(`langfuse.trace.metadata.${k}`, v));
+        }
+        else {
+            attrs.push(attrStr(`langfuse.trace.metadata.${k}`, String(v)));
+        }
+    }
+    return compactAttrs(attrs);
+}
+// Token usage, as Langfuse's own `langfuse.observation.usage_details` JSON-string
+// attribute (confirmed key name/shape via Langfuse's v4 OTel migration guide).
+// Sub-key names here (cache_read_input_tokens/cache_creation_input_tokens) mirror
+// this plugin's existing usage fields but are NOT independently confirmed against
+// Langfuse's docs for what it expects inside that JSON blob — see AGENTS.md note.
+function usageDetailsAttribute(usage) {
+    if (!usage)
+        return undefined;
+    const details = {};
+    if (typeof usage.input === "number")
+        details.input = usage.input;
+    if (typeof usage.output === "number")
+        details.output = usage.output;
+    if (typeof usage.total === "number")
+        details.total = usage.total;
+    if (typeof usage.cacheRead === "number")
+        details.cache_read_input_tokens = usage.cacheRead;
+    if (typeof usage.cacheWrite === "number")
+        details.cache_creation_input_tokens = usage.cacheWrite;
+    if (Object.keys(details).length === 0)
+        return undefined;
+    return attrStr("langfuse.observation.usage_details", JSON.stringify(details));
+}
+// gen_ai.usage.input_tokens/output_tokens are the standard OTel GenAI semantic
+// convention attribute names — added as redundant, independently-recognizable
+// usage signals alongside usage_details above (belt-and-suspenders, since which
+// one Langfuse's OTel ingest actually reads for UI display wasn't independently
+// verified beyond the migration guide's mention of "usage" attributes).
+function genAiUsageAttributes(usage) {
+    return compactAttrs([
+        attrInt("gen_ai.usage.input_tokens", usage?.input),
+        attrInt("gen_ai.usage.output_tokens", usage?.output),
+    ]);
 }
 // JSON.stringify(undefined) returns the JS value `undefined`, not a string — calling
 // .slice() on that throws. Tool calls that never received an after_tool_call (because
@@ -28,14 +125,12 @@ function safeStringifySlice(value, maxLen, fallback = "null") {
     }
     return str.slice(0, maxLen);
 }
-// Builds the span-create batch item for one tool call. Shared by generation-level and
+// Builds the OTel span for one tool call. Shared by generation-level and
 // iteration-level spans. A span with no endTime never received after_tool_call — the run
 // was aborted/killed while the tool was in flight — so it's flagged rather than dropped,
 // since a killed trace is still valuable for debugging.
-function buildSpanBatchItem(span, parentObservationId, traceId, now, dataLimits) {
+function buildToolCallSpan(span, parentSpanId, traceId, nowMs, dataLimits, sharedAttrs) {
     const killed = !span.endTime;
-    const spanStartTime = new Date(span.startTime).toISOString();
-    const spanEndTime = span.endTime ? new Date(span.endTime).toISOString() : now;
     let output;
     if (span.error) {
         output = `ERROR: ${span.error}`;
@@ -46,23 +141,29 @@ function buildSpanBatchItem(span, parentObservationId, traceId, now, dataLimits)
     else {
         output = safeStringifySlice(span.output, dataLimits.toolResult);
     }
+    const durationMs = typeof span.metadata?.durationMs === "number" ? span.metadata.durationMs : undefined;
+    const attributes = compactAttrs([
+        ...sharedAttrs,
+        attrStr("langfuse.observation.type", "tool"),
+        attrStr("langfuse.observation.input", safeStringifySlice(span.input, dataLimits.toolParams)),
+        attrStr("langfuse.observation.output", output),
+        attrStr("langfuse.observation.metadata.toolCallId", span.toolCallId),
+        attrInt("langfuse.observation.metadata.durationMs", durationMs),
+        killed ? attrBool("langfuse.observation.metadata.killed", true) : undefined,
+    ]);
     return {
-        id: randomId(),
-        type: "span-create",
-        timestamp: now,
-        body: {
-            id: span.spanId,
-            traceId,
-            parentObservationId,
-            name: span.toolName,
-            startTime: spanStartTime,
-            endTime: spanEndTime,
-            input: safeStringifySlice(span.input, dataLimits.toolParams),
-            output,
-            level: span.error ? "ERROR" : killed ? "WARNING" : "DEFAULT",
-            statusMessage: span.error ?? (killed ? "killed: run aborted before tool call completed" : undefined),
-            metadata: killed ? { ...span.metadata, killed: true } : span.metadata,
-        },
+        traceId,
+        spanId: span.spanId,
+        parentSpanId,
+        name: span.toolName,
+        startTimeUnixNano: toUnixNano(span.startTime),
+        endTimeUnixNano: toUnixNano(span.endTime ?? nowMs),
+        attributes,
+        status: span.error
+            ? { code: 2, message: span.error }
+            : killed
+                ? { code: 2, message: "killed: run aborted before tool call completed" }
+                : { code: 1 },
     };
 }
 /**
@@ -191,7 +292,7 @@ export function setupLangfuseTracer(api) {
             return;
         }
         const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
-        const traceId = randomId();
+        const traceId = newTraceId();
         // Create a new trace for this agent run
         const trace = {
             traceId,
@@ -217,7 +318,7 @@ export function setupLangfuseTracer(api) {
             debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping generation`);
             return;
         }
-        const generationId = randomId();
+        const generationId = newSpanId();
         // 🏷️ Build structured JSON input for Langfuse parsing
         const inputData = {};
         // INITIAL_SYSTEM_PROMPT as JSON key
@@ -291,7 +392,7 @@ export function setupLangfuseTracer(api) {
                 `tool call ${event.toolName}`);
             return;
         }
-        const spanId = randomId();
+        const spanId = newSpanId();
         const spanKey = `${event.runId}:${event.toolCallId ?? spanId}`;
         const span = {
             spanId,
@@ -344,7 +445,7 @@ export function setupLangfuseTracer(api) {
             debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping iteration_start`);
             return;
         }
-        const iterationId = randomId();
+        const iterationId = newSpanId();
         // Extract last 2 messages from history
         const recentMessages = Array.isArray(event.messages) && event.messages.length > 0
             ? event.messages.slice(-2)
@@ -425,7 +526,7 @@ export function setupLangfuseTracer(api) {
             debug(`[langfuse-tracer] [DEBUG] No active trace for ${key}, skipping compaction`);
             return;
         }
-        const compactionId = randomId();
+        const compactionId = newSpanId();
         const compaction = {
             compactionId,
             startTime: Date.now(),
@@ -475,8 +576,7 @@ export function setupLangfuseTracer(api) {
             return;
         }
         const { messages, success, durationMs, error } = event;
-        const now = new Date().toISOString();
-        const startTime = new Date(trace.startTime).toISOString();
+        const nowMs = Date.now();
         // Extract final assistant output from messages
         let finalOutput = "";
         let finalAssistantMessage;
@@ -518,8 +618,10 @@ export function setupLangfuseTracer(api) {
             debug(`[langfuse-tracer] [DEBUG] Completed final iteration ${lastIteration.iterationId}, ` +
                 `duration=${lastIteration.endTime - lastIteration.startTime}ms, toolCalls=0 (final)`);
         }
-        // Build the batch: Trace + Generations + Iterations + Compactions + Spans (nested structure)
-        let batch = [];
+        // Build the OTel span tree: one shared traceId, a synthetic root "agent" span
+        // (carries trace-level input/output — there's no separate trace-create call under
+        // OTLP), with Generations + Iterations + Compactions + tool-call Spans as children.
+        let spans = [];
         // Count total spans, generations, iterations, and compactions for summary
         let totalSpans = 0;
         const totalGenerations = trace.generations.length;
@@ -527,81 +629,82 @@ export function setupLangfuseTracer(api) {
         const totalCompactions = trace.compactions.length;
         trace.generations.forEach(gen => { totalSpans += gen.spans.length; });
         trace.iterations.forEach(iter => { totalSpans += iter.spans.length; });
+        const traceId = trace.traceId;
+        const rootSpanId = newSpanId();
+        // Trace-level metadata that needs to be queryable in Langfuse must be copied onto
+        // every span (not just set once on a root/trace object) — see AGENTS.md.
+        const traceMetadata = {
+            success,
+            error: error ?? undefined,
+            messageCount: messages.length,
+            totalGenerations,
+            totalIterations,
+            totalCompactions,
+            totalToolCalls: totalSpans,
+            agentDurationMs: durationMs,
+        };
         try {
             // Collect all providers and models
             const providers = new Set(trace.generations.map(g => g.provider).filter(Boolean));
             const models = new Set(trace.generations.map(g => g.model).filter(Boolean));
-            // 1. Create the Trace
-            batch.push({
-                id: randomId(),
-                type: "trace-create",
-                timestamp: now,
-                body: {
-                    id: trace.traceId,
-                    name: "openclaw-agent-run",
-                    sessionId: sessionKey ?? undefined,
-                    userId: agentId ?? "unknown",
-                    tags: [
-                        "openclaw",
-                        agentId ?? "unknown",
-                        ...Array.from(providers),
-                        ...Array.from(models),
-                    ],
-                    input: trace.userInput.slice(0, dataLimits.userInput) || undefined,
-                    output: finalOutput || undefined,
-                    metadata: {
-                        success,
-                        error: error ?? undefined,
-                        messageCount: messages.length,
-                        totalGenerations,
-                        totalIterations,
-                        totalCompactions,
-                        totalToolCalls: totalSpans,
-                        agentDurationMs: durationMs,
-                    },
-                    timestamp: startTime,
-                },
+            const tags = [
+                "openclaw",
+                agentId ?? "unknown",
+                ...Array.from(providers),
+                ...Array.from(models),
+            ];
+            const sharedAttrs = buildTraceLevelAttributes({
+                agentId,
+                sessionKey,
+                traceName: "openclaw-agent-run",
+                tags,
+                metadata: traceMetadata,
+            });
+            // 1. Root "agent" span — carries the trace-level input/output. Every other span
+            // is parented to this one, all sharing `traceId`.
+            spans.push({
+                traceId,
+                spanId: rootSpanId,
+                name: "openclaw-agent-run",
+                startTimeUnixNano: toUnixNano(trace.startTime),
+                endTimeUnixNano: toUnixNano(nowMs),
+                attributes: compactAttrs([
+                    ...sharedAttrs,
+                    attrStr("langfuse.observation.type", "agent"),
+                    attrStr("langfuse.observation.input", trace.userInput.slice(0, dataLimits.userInput) || undefined),
+                    attrStr("langfuse.observation.output", finalOutput || undefined),
+                ]),
             });
             // 2. Create each Generation observation
             trace.generations.forEach((gen) => {
-                const genStartTime = new Date(gen.startTime).toISOString();
-                const genEndTime = gen.endTime ? new Date(gen.endTime).toISOString() : now;
-                batch.push({
-                    id: randomId(),
-                    type: "generation-create",
-                    timestamp: now,
-                    body: {
-                        id: gen.generationId,
-                        traceId: trace.traceId,
-                        name: `llm-call-${gen.model ?? "unknown"}`,
-                        model: gen.model,
-                        startTime: genStartTime,
-                        endTime: genEndTime,
-                        input: gen.input || undefined,
-                        output: gen.output || undefined,
-                        usage: gen.usage ? {
-                            input: gen.usage.input,
-                            output: gen.usage.output,
-                            unit: "TOKENS",
-                        } : undefined,
-                        metadata: {
-                            provider: gen.provider,
-                            runId: gen.runId,
-                            toolCallsCount: gen.spans.length,
-                            cacheRead: gen.usage?.cacheRead,
-                            cacheWrite: gen.usage?.cacheWrite,
-                        },
-                    },
+                spans.push({
+                    traceId,
+                    spanId: gen.generationId,
+                    parentSpanId: rootSpanId,
+                    name: `llm-call-${gen.model ?? "unknown"}`,
+                    startTimeUnixNano: toUnixNano(gen.startTime),
+                    endTimeUnixNano: toUnixNano(gen.endTime ?? nowMs),
+                    attributes: compactAttrs([
+                        ...sharedAttrs,
+                        attrStr("langfuse.observation.type", "generation"),
+                        attrStr("langfuse.observation.input", gen.input || undefined),
+                        attrStr("langfuse.observation.output", gen.output || undefined),
+                        attrStr("gen_ai.request.model", gen.model),
+                        attrStr("langfuse.observation.model.name", gen.model),
+                        attrStr("langfuse.observation.metadata.provider", gen.provider),
+                        attrStr("langfuse.observation.metadata.runId", gen.runId),
+                        attrInt("langfuse.observation.metadata.toolCallsCount", gen.spans.length),
+                        usageDetailsAttribute(gen.usage),
+                        ...genAiUsageAttributes(gen.usage),
+                    ]),
                 });
                 // 3. Create each Span (tool call) under this generation
                 gen.spans.forEach((span) => {
-                    batch.push(buildSpanBatchItem(span, gen.generationId, trace.traceId, now, dataLimits));
+                    spans.push(buildToolCallSpan(span, gen.generationId, traceId, nowMs, dataLimits, sharedAttrs));
                 });
             });
             // 3. Create each Iteration observation (agent_iteration_start → agent_iteration_end)
             trace.iterations.forEach((iter) => {
-                const iterStartTime = new Date(iter.startTime).toISOString();
-                const iterEndTime = iter.endTime ? new Date(iter.endTime).toISOString() : now;
                 // 🏷️ Build structured JSON input for Langfuse parsing
                 const inputData = {};
                 // TOOL_RESULTS as JSON key
@@ -648,42 +751,33 @@ export function setupLangfuseTracer(api) {
                 catch (err) {
                     outputStr = JSON.stringify({ error: "Failed to serialize output" });
                 }
-                batch.push({
-                    id: randomId(),
-                    type: "generation-create",
-                    timestamp: now,
-                    body: {
-                        id: iter.iterationId,
-                        traceId: trace.traceId,
-                        name: `iteration-${iter.iterationNumber}`,
-                        startTime: iterStartTime,
-                        endTime: iterEndTime,
-                        input: inputStr,
-                        output: outputStr,
-                        usage: iter.usage ? {
-                            input: iter.usage.input,
-                            output: iter.usage.output,
-                            unit: "TOKENS",
-                        } : undefined,
-                        metadata: {
-                            iterationType: "llm-iteration",
-                            iterationNumber: iter.iterationNumber,
-                            runId: iter.runId,
-                            toolCallsPlanned: iter.toolCalls?.length ?? 0,
-                            cacheRead: iter.usage?.cacheRead,
-                            cacheWrite: iter.usage?.cacheWrite,
-                        },
-                    },
+                spans.push({
+                    traceId,
+                    spanId: iter.iterationId,
+                    parentSpanId: rootSpanId,
+                    name: `iteration-${iter.iterationNumber}`,
+                    startTimeUnixNano: toUnixNano(iter.startTime),
+                    endTimeUnixNano: toUnixNano(iter.endTime ?? nowMs),
+                    attributes: compactAttrs([
+                        ...sharedAttrs,
+                        attrStr("langfuse.observation.type", "generation"),
+                        attrStr("langfuse.observation.input", inputStr),
+                        attrStr("langfuse.observation.output", outputStr),
+                        attrStr("langfuse.observation.metadata.iterationType", "llm-iteration"),
+                        attrInt("langfuse.observation.metadata.iterationNumber", iter.iterationNumber),
+                        attrStr("langfuse.observation.metadata.runId", iter.runId),
+                        attrInt("langfuse.observation.metadata.toolCallsPlanned", iter.toolCalls?.length ?? 0),
+                        usageDetailsAttribute(iter.usage),
+                        ...genAiUsageAttributes(iter.usage),
+                    ]),
                 });
                 // Attach tool execution spans under this iteration
                 iter.spans.forEach((span) => {
-                    batch.push(buildSpanBatchItem(span, iter.iterationId, trace.traceId, now, dataLimits));
+                    spans.push(buildToolCallSpan(span, iter.iterationId, traceId, nowMs, dataLimits, sharedAttrs));
                 });
             });
             // 4. Create each Compaction observation
             trace.compactions.forEach((comp) => {
-                const compStartTime = new Date(comp.startTime).toISOString();
-                const compEndTime = comp.endTime ? new Date(comp.endTime).toISOString() : now;
                 // 🏷️ Build structured JSON for compaction changes
                 const inputData = {};
                 // BEFORE_COMPACTION as JSON key
@@ -719,86 +813,91 @@ export function setupLangfuseTracer(api) {
                         reduced: (comp.messageCountBefore ?? 0) - (comp.messageCountAfter ?? 0),
                     },
                 };
-                batch.push({
-                    id: randomId(),
-                    type: "span-create",
-                    timestamp: now,
-                    body: {
-                        id: comp.compactionId,
-                        traceId: trace.traceId,
-                        name: "compaction",
-                        startTime: compStartTime,
-                        endTime: compEndTime,
-                        input: inputStr,
-                        output: JSON.stringify(outputData, null, 2),
-                        metadata: {
-                            type: "context-compaction",
-                            messageCountBefore: comp.messageCountBefore,
-                            messageCountAfter: comp.messageCountAfter,
-                            reduction: comp.messageCountBefore && comp.messageCountAfter
-                                ? comp.messageCountBefore - comp.messageCountAfter
-                                : undefined,
-                        },
-                    },
+                spans.push({
+                    traceId,
+                    spanId: comp.compactionId,
+                    parentSpanId: rootSpanId,
+                    name: "compaction",
+                    startTimeUnixNano: toUnixNano(comp.startTime),
+                    endTimeUnixNano: toUnixNano(comp.endTime ?? nowMs),
+                    attributes: compactAttrs([
+                        ...sharedAttrs,
+                        attrStr("langfuse.observation.type", "span"),
+                        attrStr("langfuse.observation.input", inputStr),
+                        attrStr("langfuse.observation.output", JSON.stringify(outputData, null, 2)),
+                        attrStr("langfuse.observation.metadata.type", "context-compaction"),
+                        attrInt("langfuse.observation.metadata.messageCountBefore", comp.messageCountBefore),
+                        attrInt("langfuse.observation.metadata.messageCountAfter", comp.messageCountAfter),
+                        attrInt("langfuse.observation.metadata.reduction", comp.messageCountBefore && comp.messageCountAfter
+                            ? comp.messageCountBefore - comp.messageCountAfter
+                            : undefined),
+                    ]),
                 });
             });
         }
         catch (err) {
             // Even a malformed/killed trace is worth debugging in Langfuse — never drop it
             // silently just because one generation/iteration/span failed to serialize.
-            api.logger.warn(`[langfuse-tracer] Failed to build full batch for trace ${trace.traceId}, ` +
-                `sending minimal trace record instead: ${String(err)}`);
-            batch = [{
-                    id: randomId(),
-                    type: "trace-create",
-                    timestamp: now,
-                    body: {
-                        id: trace.traceId,
-                        name: "openclaw-agent-run",
-                        sessionId: sessionKey ?? undefined,
-                        userId: agentId ?? "unknown",
-                        tags: ["openclaw", agentId ?? "unknown", "batch-build-error"],
-                        input: (trace.userInput || "").slice(0, dataLimits.userInput) || undefined,
-                        output: finalOutput || undefined,
-                        metadata: {
-                            success,
-                            error: error ?? undefined,
-                            batchBuildError: String(err),
-                            messageCount: messages.length,
-                            totalGenerations,
-                            totalIterations,
-                            totalCompactions,
-                            totalToolCalls: totalSpans,
-                            agentDurationMs: durationMs,
-                        },
-                        timestamp: startTime,
-                    },
+            api.logger.warn(`[langfuse-tracer] Failed to build full span tree for trace ${traceId}, ` +
+                `sending minimal root span instead: ${String(err)}`);
+            const fallbackAttrs = buildTraceLevelAttributes({
+                agentId,
+                sessionKey,
+                traceName: "openclaw-agent-run",
+                tags: ["openclaw", agentId ?? "unknown", "batch-build-error"],
+                metadata: { ...traceMetadata, batchBuildError: String(err) },
+            });
+            spans = [{
+                    traceId,
+                    spanId: rootSpanId,
+                    name: "openclaw-agent-run",
+                    startTimeUnixNano: toUnixNano(trace.startTime),
+                    endTimeUnixNano: toUnixNano(nowMs),
+                    attributes: compactAttrs([
+                        ...fallbackAttrs,
+                        attrStr("langfuse.observation.type", "agent"),
+                        attrStr("langfuse.observation.input", (trace.userInput || "").slice(0, dataLimits.userInput) || undefined),
+                        attrStr("langfuse.observation.output", finalOutput || undefined),
+                    ]),
                 }];
         }
         // Cleanup
         activeTraces.delete(key);
         trace.generations.forEach(gen => activeGenerations.delete(gen.runId));
         trace.iterations.forEach(iter => activeIterations.delete(iter.runId));
-        debug(`[langfuse-tracer] [DEBUG] Sending batch: ` +
+        debug(`[langfuse-tracer] [DEBUG] Sending OTLP export: ` +
             `${totalGenerations} generations, ${totalIterations} iterations, ` +
             `${totalCompactions} compactions, ${totalSpans} spans, ` +
-            `${batch.length} total items`);
+            `${spans.length} total OTel spans`);
+        const exportRequest = {
+            resourceSpans: [
+                {
+                    resource: { attributes: [] },
+                    scopeSpans: [
+                        {
+                            scope: { name: "openclaw-langfuse-tracer" },
+                            spans,
+                        },
+                    ],
+                },
+            ],
+        };
         try {
-            const res = await fetch(`${trace.credentials.baseUrl}/api/public/ingestion`, {
+            const res = await fetch(`${trace.credentials.baseUrl}/api/public/otel/v1/traces`, {
                 method: "POST",
                 headers: {
                     Authorization: trace.credentials.authHeader,
                     "Content-Type": "application/json",
                     "x-langfuse-ingestion-version": "4",
                 },
-                body: JSON.stringify({ batch }),
+                body: JSON.stringify(exportRequest),
             });
             if (!res.ok) {
                 const text = await res.text().catch(() => "");
-                api.logger.warn(`[langfuse-tracer] Ingestion failed ${res.status}: ${text.slice(0, 200)}`);
+                api.logger.warn(`[langfuse-tracer] OTLP export failed ${res.status}: ${text.slice(0, 200)}`);
             }
             else {
-                api.logger.info(`[langfuse-tracer] ✓ Sent trace ${trace.traceId} for agent "${agentId}": ` +
+                api.logger.info(`[langfuse-tracer] ✓ Sent trace ${traceId} for agent "${agentId}": ` +
                     `${totalGenerations} generations, ${totalIterations} iterations, ` +
                     `${totalCompactions} compactions, ${totalSpans} tool calls`);
             }
