@@ -1170,6 +1170,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
         headers: {
           Authorization: trace.credentials.authHeader,
           "Content-Type": "application/json",
+          "x-langfuse-ingestion-version": "4",
         },
         body: JSON.stringify({ batch }),
       });

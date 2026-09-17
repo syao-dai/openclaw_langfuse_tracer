@@ -789,6 +789,7 @@ export function setupLangfuseTracer(api) {
                 headers: {
                     Authorization: trace.credentials.authHeader,
                     "Content-Type": "application/json",
+                    "x-langfuse-ingestion-version": "4",
                 },
                 body: JSON.stringify({ batch }),
             });
