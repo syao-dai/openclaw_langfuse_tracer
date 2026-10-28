@@ -24,7 +24,7 @@ This plugin follows the standard OpenClaw plugin architecture:
 
 The plugin listens to these OpenClaw hook events:
 
-- `before_agent_start` - Captures initial user prompt
+- `before_agent_run` - Captures initial user prompt (replaces removed `before_agent_start`)
 - `llm_input` - Captures system prompt, history, and model info
 - `llm_output` - Captures token usage and assistant response
 - `before_tool_call` - Records tool invocation start
@@ -221,7 +221,7 @@ openclaw gateway restart
 You should see:
 ```
 [langfuse-tracer] Debug mode enabled
-[langfuse-tracer] [DEBUG] before_agent_start: ...
+[langfuse-tracer] [DEBUG] before_agent_run: ...
 [langfuse-tracer] [DEBUG] llm_input: ...
 [langfuse-tracer] [DEBUG] llm_output: ...
 [langfuse-tracer] [DEBUG] agent_end: ...

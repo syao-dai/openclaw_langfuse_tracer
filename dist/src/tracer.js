@@ -276,37 +276,44 @@ export function setupLangfuseTracer(api) {
     const pendingToolCalls = resolveGlobalMap("openclaw.langfuse-tracer.pendingToolCalls");
     // Store compaction context for each session
     const pendingCompactions = resolveGlobalMap("openclaw.langfuse-tracer.pendingCompactions");
-    api.on("before_agent_start", (event, eventCtx) => {
-        debug(`[langfuse-tracer] [DEBUG] before_agent_start: ` +
-            `agentId=${eventCtx.agentId}, sessionKey=${eventCtx.sessionKey}, ` +
-            `prompt=${event.prompt?.slice(0, 100)}...`);
-        // Filter: only track specified agents if trackedAgents is configured
-        if (trackedAgents !== null && eventCtx.agentId && !trackedAgents.has(eventCtx.agentId)) {
-            debug(`[langfuse-tracer] [DEBUG] Skipping agent ${eventCtx.agentId} (not in trackedAgents)`);
-            return;
+    // before_agent_start was removed upstream (2026.10); before_agent_run is the replacement.
+    // It is a gating hook: a throw is treated as a block, so never let tracing break the run.
+    api.on("before_agent_run", (event, eventCtx) => {
+        try {
+            debug(`[langfuse-tracer] [DEBUG] before_agent_run: ` +
+                `agentId=${eventCtx.agentId}, sessionKey=${eventCtx.sessionKey}, ` +
+                `prompt=${event.prompt?.slice(0, 100)}...`);
+            // Filter: only track specified agents if trackedAgents is configured
+            if (trackedAgents !== null && eventCtx.agentId && !trackedAgents.has(eventCtx.agentId)) {
+                debug(`[langfuse-tracer] [DEBUG] Skipping agent ${eventCtx.agentId} (not in trackedAgents)`);
+                return;
+            }
+            const credentials = resolveCredentials(eventCtx.agentId);
+            if (!credentials) {
+                debug(`[langfuse-tracer] [DEBUG] No Langfuse credential group matches agent ` +
+                    `${eventCtx.agentId} (and no default/catch-all group configured), skipping trace`);
+                return;
+            }
+            const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
+            const traceId = newTraceId();
+            // Create a new trace for this agent run
+            const trace = {
+                traceId,
+                agentId: eventCtx.agentId,
+                sessionKey: eventCtx.sessionKey,
+                userInput: event.prompt ?? "",
+                startTime: Date.now(),
+                generations: [],
+                iterations: [],
+                compactions: [],
+                credentials,
+            };
+            activeTraces.set(key, trace);
+            debug(`[langfuse-tracer] [DEBUG] Created trace ${traceId} for ${key}`);
         }
-        const credentials = resolveCredentials(eventCtx.agentId);
-        if (!credentials) {
-            debug(`[langfuse-tracer] [DEBUG] No Langfuse credential group matches agent ` +
-                `${eventCtx.agentId} (and no default/catch-all group configured), skipping trace`);
-            return;
+        catch (err) {
+            debug(`[langfuse-tracer] [DEBUG] before_agent_run failed (run not blocked): ${String(err)}`);
         }
-        const key = eventCtx.sessionKey ?? eventCtx.agentId ?? "default";
-        const traceId = newTraceId();
-        // Create a new trace for this agent run
-        const trace = {
-            traceId,
-            agentId: eventCtx.agentId,
-            sessionKey: eventCtx.sessionKey,
-            userInput: event.prompt ?? "",
-            startTime: Date.now(),
-            generations: [],
-            iterations: [],
-            compactions: [],
-            credentials,
-        };
-        activeTraces.set(key, trace);
-        debug(`[langfuse-tracer] [DEBUG] Created trace ${traceId} for ${key}`);
     });
     // Capture LLM input - start a new Generation observation
     api.on("llm_input", (event, eventCtx) => {

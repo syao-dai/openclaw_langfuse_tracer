@@ -230,7 +230,7 @@ openclaw config set plugins.entries.langfuse-tracer.config.credentials '[
 openclaw gateway restart
 ```
 
-Resolution order for a given agent's trace, at `before_agent_start`:
+Resolution order for a given agent's trace, at `before_agent_run`:
 
 1. The first `credentials[]` entry whose `agentIds` includes that agent's ID.
 2. Otherwise, the first entry with no `agentIds` (or an empty list) — the default/catch-all group.
@@ -471,7 +471,7 @@ See [INVESTIGATION.md](INVESTIGATION.md) for technical details and future enhanc
    ```
    [langfuse-tracer] Tracking all agents
    [langfuse-tracer] Langfuse tracing enabled → http://...
-      [langfuse-tracer] [DEBUG] before_agent_start: ...
+      [langfuse-tracer] [DEBUG] before_agent_run: ...
    [langfuse-tracer] [DEBUG] llm_input: ...
    [langfuse-tracer] [DEBUG] llm_output: ...
    [langfuse-tracer] [DEBUG] agent_end: ...    <-- This should appear!
@@ -516,7 +516,7 @@ Common causes:
 │  OpenClaw Agent │
 └────────┬────────┘
          │ Events:
-         │ - before_agent_start
+         │ - before_agent_run
          │ - llm_input
          │ - llm_output
          │ - before_tool_call
@@ -546,7 +546,7 @@ Common causes:
 
 ### Event Flow
 
-1. **before_agent_start** → Capture initial prompt
+1. **before_agent_run** → Capture initial prompt
 2. **llm_input** → Capture system prompt, history, model
 3. **before_tool_call** → Record tool invocation
 4. **after_tool_call** → Record tool result and timing

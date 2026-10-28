@@ -2,7 +2,7 @@ Telegraph style. Scoped to this submodule (own git repo: `syao-dai/openclaw_lang
 
 ## What this is
 
-OpenClaw plugin. `openclaw.plugin.json` + `package.json#openclaw.extensions` load `dist/index.js`, which calls `setupLangfuseTracer(api)` from `src/tracer.ts`. Registers hooks (`before_agent_start`, `llm_input`/`llm_output`, `before_tool_call`/`after_tool_call`, `agent_iteration_start/end`, `before_compaction`/`after_compaction`, `agent_end`) to assemble one Langfuse trace per agent run and, on `agent_end`, POST it as an OTLP/JSON `ExportTraceServiceRequest` to `POST {baseUrl}/api/public/otel/v1/traces`.
+OpenClaw plugin. `openclaw.plugin.json` + `package.json#openclaw.extensions` load `dist/index.js`, which calls `setupLangfuseTracer(api)` from `src/tracer.ts`. Registers hooks (`before_agent_run`, `llm_input`/`llm_output`, `before_tool_call`/`after_tool_call`, `agent_iteration_start/end`, `before_compaction`/`after_compaction`, `agent_end`) to assemble one Langfuse trace per agent run and, on `agent_end`, POST it as an OTLP/JSON `ExportTraceServiceRequest` to `POST {baseUrl}/api/public/otel/v1/traces`.
 
 ## Ingestion protocol: OTLP/JSON, not the legacy batch-item API
 
