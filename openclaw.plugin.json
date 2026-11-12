@@ -1,6 +1,15 @@
 {
   "id": "langfuse-tracer",
-    "configSchema": {
+  "configContracts": {
+    "secretInputs": {
+      "paths": [
+        { "path": "credentials.*.publicKey", "expected": "string" },
+        { "path": "credentials.*.secretKey", "expected": "string" },
+        { "path": "credentials.*.agentIds", "expected": "string" }
+      ]
+    }
+  },
+  "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
@@ -38,12 +47,12 @@
           "additionalProperties": false,
           "properties": {
             "publicKey": {
-              "type": "string",
-              "description": "Langfuse project public key"
+              "type": ["string", "object"],
+              "description": "Langfuse project public key (plain string or SecretRef)"
             },
             "secretKey": {
-              "type": "string",
-              "description": "Langfuse project secret key"
+              "type": ["string", "object"],
+              "description": "Langfuse project secret key (plain string or SecretRef)"
             },
             "baseUrl": {
               "type": "string",
@@ -51,9 +60,9 @@
               "default": "http://172.21.0.1:3050"
             },
             "agentIds": {
-              "type": "array",
+              "type": ["array", "string", "object"],
               "items": { "type": "string" },
-              "description": "Agent IDs this credential group applies to. Omit or leave empty to make this the default/catch-all group."
+              "description": "Agent IDs this credential group applies to: an array of IDs, or a string (comma-separated or JSON array) / SecretRef resolving to one. Omit or leave empty to make this the default/catch-all group."
             }
           },
           "required": ["publicKey", "secretKey"]
@@ -129,6 +138,14 @@
     "credentials": {
       "label": "Langfuse Credential Groups",
       "help": "One entry per Langfuse project. Scope an entry to specific agents via 'agentIds', or leave it unscoped to act as the default for any other agent."
+    },
+    "credentials.*.publicKey": {
+      "label": "Public Key",
+      "sensitive": true
+    },
+    "credentials.*.secretKey": {
+      "label": "Secret Key",
+      "sensitive": true
     },
     "trackedAgents": {
       "label": "Tracked Agents",

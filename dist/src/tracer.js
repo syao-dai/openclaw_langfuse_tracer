@@ -186,6 +186,25 @@ function resolveGlobalMap(key) {
     globalStore[symbolKey] = created;
     return created;
 }
+// `agentIds` may arrive as a resolved SecretRef string: a JSON array or comma-separated list.
+function normalizeAgentIds(value) {
+    if (Array.isArray(value))
+        return value.map(String).map((s) => s.trim()).filter(Boolean);
+    if (typeof value !== "string")
+        return undefined;
+    const raw = value.trim();
+    if (raw.startsWith("[")) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed))
+                return parsed.map(String).map((s) => s.trim()).filter(Boolean);
+        }
+        catch {
+            // fall through to comma-separated parsing
+        }
+    }
+    return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
 export function setupLangfuseTracer(api) {
     const pluginConfig = (api.pluginConfig ?? {});
     // Setup logging
@@ -201,7 +220,9 @@ export function setupLangfuseTracer(api) {
     // existing single-project configs keep working unchanged.
     const defaultBaseUrl = "http://172.21.0.1:3050";
     const isValidGroup = (group) => Boolean(group?.publicKey?.trim() && group?.secretKey?.trim());
-    const credentialGroups = (Array.isArray(pluginConfig.credentials) ? pluginConfig.credentials : []).filter(isValidGroup);
+    const credentialGroups = (Array.isArray(pluginConfig.credentials) ? pluginConfig.credentials : [])
+        .map((group) => ({ ...group, agentIds: normalizeAgentIds(group?.agentIds) }))
+        .filter(isValidGroup);
     const hasExplicitCatchAll = credentialGroups.some((group) => !group.agentIds || group.agentIds.length === 0);
     if (!hasExplicitCatchAll && isValidGroup(pluginConfig.langfuse)) {
         credentialGroups.push(pluginConfig.langfuse);
