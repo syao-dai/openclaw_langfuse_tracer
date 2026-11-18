@@ -21,7 +21,7 @@ import { randomBytes } from "node:crypto";
  *   credentials               — Array of Langfuse credential groups, each:
  *     credentials[].publicKey   — Langfuse project public key (required)
  *     credentials[].secretKey   — Langfuse project secret key (required)
- *     credentials[].baseUrl     — Langfuse server URL (default: http://172.21.0.1:3050)
+ *     credentials[].baseUrl     — Langfuse server URL (required, no default)
  *     credentials[].agentIds    — Agent IDs this group applies to (omit/empty = default/catch-all)
  *   langfuse                  — Deprecated single-project shorthand; folded in as the
  *                                catch-all group if `credentials` has none. Same shape
@@ -450,11 +450,23 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   // projects, each optionally scoped to a set of agent IDs; the legacy
   // `langfuse` object (if present) is folded in as the catch-all group so
   // existing single-project configs keep working unchanged.
-  const defaultBaseUrl = "http://172.21.0.1:3050";
-  const isValidGroup = (
+  // `baseUrl` is required (no built-in default, to avoid hardcoding a dev IP).
+  const hasKeys = (
     group: CredentialGroup | undefined,
   ): group is CredentialGroup & { publicKey: string; secretKey: string } =>
     Boolean(group?.publicKey?.trim() && group?.secretKey?.trim());
+  const isValidGroup = (
+    group: CredentialGroup | undefined,
+  ): group is CredentialGroup & { publicKey: string; secretKey: string; baseUrl: string } => {
+    if (!hasKeys(group)) return false;
+    if (group.baseUrl?.trim()) return true;
+    api.logger.error(
+      "[langfuse-tracer] Langfuse credentials group is missing required `baseUrl` " +
+      `(agents: ${group.agentIds?.join(", ") || "default/catch-all"}) — group ignored. ` +
+      "Set e.g. \"baseUrl\":\"http://langfuse:3000\" in the group.",
+    );
+    return false;
+  };
 
   const credentialGroups: CredentialGroup[] = (
     Array.isArray(pluginConfig.credentials) ? pluginConfig.credentials : []
@@ -470,8 +482,8 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
   }
 
   if (credentialGroups.length === 0) {
-    api.logger.info(
-      "[langfuse-tracer] Langfuse credentials not configured. " +
+    api.logger.error(
+      "[langfuse-tracer] Langfuse credentials (publicKey, secretKey, baseUrl) not configured. " +
       "Configure via openclaw.json, e.g.:\n" +
       "  openclaw config set plugins.entries.langfuse-tracer.config.credentials " +
       "'[{\"publicKey\":\"pk-lf-xxx\",\"secretKey\":\"sk-lf-xxx\",\"baseUrl\":\"http://langfuse:3000\"}]'\n" +
@@ -495,7 +507,7 @@ export function setupLangfuseTracer(api: OpenClawPluginApi): void {
       authHeaderCache.set(key, authHeader);
     }
     return {
-      baseUrl: (group.baseUrl?.trim() ?? defaultBaseUrl).replace(/\/$/, ""),
+      baseUrl: (group.baseUrl ?? "").trim().replace(/\/$/, ""),
       authHeader,
     };
   };

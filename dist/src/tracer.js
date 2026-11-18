@@ -218,8 +218,18 @@ export function setupLangfuseTracer(api) {
     // projects, each optionally scoped to a set of agent IDs; the legacy
     // `langfuse` object (if present) is folded in as the catch-all group so
     // existing single-project configs keep working unchanged.
-    const defaultBaseUrl = "http://172.21.0.1:3050";
-    const isValidGroup = (group) => Boolean(group?.publicKey?.trim() && group?.secretKey?.trim());
+    // `baseUrl` is required (no built-in default, to avoid hardcoding a dev IP).
+    const hasKeys = (group) => Boolean(group?.publicKey?.trim() && group?.secretKey?.trim());
+    const isValidGroup = (group) => {
+        if (!hasKeys(group))
+            return false;
+        if (group.baseUrl?.trim())
+            return true;
+        api.logger.error("[langfuse-tracer] Langfuse credentials group is missing required `baseUrl` " +
+            `(agents: ${group.agentIds?.join(", ") || "default/catch-all"}) — group ignored. ` +
+            "Set e.g. \"baseUrl\":\"http://langfuse:3000\" in the group.");
+        return false;
+    };
     const credentialGroups = (Array.isArray(pluginConfig.credentials) ? pluginConfig.credentials : [])
         .map((group) => ({ ...group, agentIds: normalizeAgentIds(group?.agentIds) }))
         .filter(isValidGroup);
@@ -228,7 +238,7 @@ export function setupLangfuseTracer(api) {
         credentialGroups.push(pluginConfig.langfuse);
     }
     if (credentialGroups.length === 0) {
-        api.logger.info("[langfuse-tracer] Langfuse credentials not configured. " +
+        api.logger.error("[langfuse-tracer] Langfuse credentials (publicKey, secretKey, baseUrl) not configured. " +
             "Configure via openclaw.json, e.g.:\n" +
             "  openclaw config set plugins.entries.langfuse-tracer.config.credentials " +
             "'[{\"publicKey\":\"pk-lf-xxx\",\"secretKey\":\"sk-lf-xxx\",\"baseUrl\":\"http://langfuse:3000\"}]'\n" +
@@ -249,7 +259,7 @@ export function setupLangfuseTracer(api) {
             authHeaderCache.set(key, authHeader);
         }
         return {
-            baseUrl: (group.baseUrl?.trim() ?? defaultBaseUrl).replace(/\/$/, ""),
+            baseUrl: (group.baseUrl ?? "").trim().replace(/\/$/, ""),
             authHeader,
         };
     };

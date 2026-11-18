@@ -124,7 +124,7 @@ openclaw gateway restart
 | ---------- | ----------- | ------- |
 | `langfuse.publicKey` | Langfuse project public key | *(required)* |
 | `langfuse.secretKey` | Langfuse project secret key | *(required)* |
-| `langfuse.baseUrl` | Langfuse server URL | `http://172.21.0.1:3050` |
+| `langfuse.baseUrl` | Langfuse server URL | *(required)* |
 
 #### Logging
 

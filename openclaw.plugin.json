@@ -33,11 +33,10 @@
           },
           "baseUrl": {
             "type": "string",
-            "description": "Langfuse server URL",
-            "default": "http://172.21.0.1:3050"
+            "description": "Langfuse server URL (required), e.g. http://langfuse-web:3000"
           }
         },
-        "required": ["publicKey", "secretKey"]
+        "required": ["publicKey", "secretKey", "baseUrl"]
       },
       "credentials": {
         "type": "array",
@@ -56,8 +55,7 @@
             },
             "baseUrl": {
               "type": "string",
-              "description": "Langfuse server URL",
-              "default": "http://172.21.0.1:3050"
+              "description": "Langfuse server URL (required), e.g. http://langfuse-web:3000"
             },
             "agentIds": {
               "type": ["array", "string", "object"],
@@ -65,7 +63,7 @@
               "description": "Agent IDs this credential group applies to: an array of IDs, or a string (comma-separated or JSON array) / SecretRef resolving to one. Omit or leave empty to make this the default/catch-all group."
             }
           },
-          "required": ["publicKey", "secretKey"]
+          "required": ["publicKey", "secretKey", "baseUrl"]
         },
         "default": []
       },

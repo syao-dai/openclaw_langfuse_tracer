@@ -252,7 +252,7 @@ Resolution order for a given agent's trace, at `before_agent_run`:
 
 | Config Key                | Description                                                          | Default                  |
 | -------------------------- | ---------------------------------------------------------------------- | ------------------------ |
-| `credentials[].baseUrl`    | Langfuse server URL for this group                                     | `http://172.21.0.1:3050` |
+| `credentials[].baseUrl`    | Langfuse server URL for this group                                     | _(required)_             |
 | `credentials[].agentIds`   | Agent IDs this group applies to; omit/empty = default/catch-all group  | _(none — catch-all)_     |
 | `langfuse.*`               | Deprecated single-project shorthand; same shape as one `credentials[]` entry, minus `agentIds`. Folded in as the catch-all group only if `credentials` defines none | _(unset)_ |
 | `logLevel`               | Log level: `info` or `debug`              | `info`                   |
@@ -732,7 +732,11 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 📊 Changelog
 
-### v2026.4.7 (Current)
+### v2026.11.18 (Current)
+
+- `baseUrl` is now required (no built-in default); groups missing it are skipped with an error log
+
+### v2026.4.7
 
 - ✅ **Plugin-based configuration** - All settings managed via openclaw.json (no environment variables needed)
 - ✅ **Debug logging** - Configurable log level (`info` or `debug`) for troubleshooting
